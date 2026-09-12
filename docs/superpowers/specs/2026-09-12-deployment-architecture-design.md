@@ -6,11 +6,33 @@
   **어떤 인프라 위에, 어떻게 배포하고, 어떻게 통신시킬지**를 다룬다. 탐지 로직(PE 분석, YARA,
   블룸 필터 파라미터 등) 자체는 다루지 않는다.
 
+## 0. 변경 이력
+
+- 2026-09-12: 배포 방식을 jar + S3 + CodeDeploy에서 **Docker + SSH 직접 배포**로 변경. 사유:
+  개발/운영 환경 일관성 확보 및 컨테이너 기반 개발을 채택. 레지스트리(ECR/GHCR) 없이 GitHub
+  Actions가 EC2에 SSH로 접속해 직접 빌드/기동하는 방식으로 단순화 (4장 참고)
+- 2026-09-12: RDB를 **MySQL → PostgreSQL**로 변경. 단, 팀원 제안(화이트/블랙리스트 전용)에
+  **판정 이력 저장 역할을 추가**로 유지 — 원래 제품 설계 문서의 "판정 결과 캐싱 및 이력 저장"
+  요구사항이 팀원 다이어그램에 빠져 있어 보완함 (2장 참고, 팀원 공유 필요 —
+  [`2026-09-12-decisions-to-communicate.md`](2026-09-12-decisions-to-communicate.md))
+- 2026-09-12: 팀원 제안을 다음과 같이 일괄 채택
+  - Redis 자체 호스팅 → **Amazon ElastiCache**(관리형)
+  - 관리 콘솔을 EC2/nginx가 아닌 **Vercel**에 별도 배포
+  - 에이전트 ↔ 검사 서버 프로토콜을 **gRPC**로 확정 (nginx가 gRPC 라우팅).
+    관리 콘솔(Vercel, 브라우저) ↔ 검사 서버는 별도 채널로 **REST + SSE** 유지 — 로컬 에이전트
+    통신과 프론트 통신은 서로 독립적이라 프로토콜을 통일할 필요가 없음 (gRPC-Web/Envoy 불필요)
+  - **Prometheus + Grafana** 모니터링 스택 추가 (EC2 Docker Compose에 컨테이너로 포함)
+  - **VirusTotal API, NVD/CVE 피드**와 교차조회하는 외부 위협 인텔리전스 연동 추가. 단, 팀원
+    제안엔 장애 시 정책이 없어 **fail-open(장애 시 로컬 YARA/PE 분석 결과만으로 판정)**을
+    기본값으로 보완 (팀원 공유 필요)
+  - **Slack** 알림 채널 추가 (탐지 이벤트 발생 시 Webhook 전송)
+  - 격리 파일 저장 시 **S3 서버 측 암호화(SSE)** 적용 명시
+
 ## 1. 배경
 
 사용자가 제시한 레퍼런스 아키텍처(EC2 단일 인스턴스 + nginx + Spring Boot + React + RDS MySQL +
-S3/CodeDeploy + GitHub Actions 기반의 개인 프로젝트 배포 구조)를 그대로 채택하되, 이 프로젝트에만
-있는 두 가지 요소를 추가한다.
+S3/CodeDeploy + GitHub Actions 기반의 개인 프로젝트 배포 구조)를 출발점으로 채택하되, 이 프로젝트에만
+있는 두 가지 요소를 추가한다. (배포 방식 자체는 이후 Docker + SSH 직접 배포로 변경됨 — 0장 변경 이력 참고)
 
 1. **로컬 에이전트** — 사용자 PC에서 실행되는 프록시 프로세스. 서버 인프라가 아니므로 EC2 위에
    올라가지 않는다.
@@ -21,61 +43,85 @@ S3/CodeDeploy + GitHub Actions 기반의 개인 프로젝트 배포 구조)를 �
 
 | 구성 요소 | 역할 | 비고 |
 |---|---|---|
-| 사용자 PC (로컬 에이전트) | 다운로드 트래픽 가로채기, 프록시 | 배포 파이프라인 없음, 다이어그램상 단일 박스 |
-| EC2 (단일 인스턴스) | nginx(SSL 종료) + Spring Boot(검사 서버, 8080) + React(관리 콘솔, 3000) | 레퍼런스와 동일하게 한 인스턴스에 통합 |
-| Redis (EC2 내 또는 별도) | 블룸 필터 1차 필터링 + 해시 캐시 | 단일 인스턴스 기준, pub/sub 불필요 |
-| RDS MySQL | 판정 이력 저장 | 레퍼런스와 동일 |
-| S3 #1 (배포용 버킷) | 빌드 아티팩트(jar, React 정적 파일) | CodeDeploy가 여기서 가져감 |
-| S3 #2 (격리 전용 버킷, 신규) | 악성 판정 파일 보관 (오탐 복원용) | 배포용 버킷과 분리 |
-| IAM + CodeDeploy | 배포 권한 및 자동 배포 | 레퍼런스와 동일 |
-| GitHub Actions | CI/CD | 레퍼런스와 동일, 로컬 에이전트 빌드는 포함하지 않음 |
+| 사용자 PC (로컬 에이전트) | 다운로드 트래픽 가로채기, 프록시 | 배포 파이프라인 없음, 다이어그램상 단일 박스. 서버와는 gRPC로 통신 |
+| EC2 (단일 인스턴스, Docker) | nginx(TLS 종료, gRPC 라우팅) + API 서버(Spring Boot, 8080) + 탐지 엔진(YARA·정책분석, 별도 컨테이너) + Prometheus + Grafana | Docker Compose로 함께 기동. React는 더 이상 여기 없음(관리 콘솔 참고) |
+| 관리 콘솔 (Vercel) | React 정적 사이트 | EC2와 별도 배포. 검사 서버와 REST + SSE로 통신 (에이전트의 gRPC 채널과는 무관한 별도 채널) |
+| Amazon ElastiCache (Redis) | 블룸 필터 1차 필터링 + 해시 캐시 | 관리형으로 전환, pub/sub 불필요 |
+| RDS PostgreSQL | 판정 이력 저장 + 화이트/블랙리스트 | 팀원 제안(PostgreSQL) 채택, 판정 이력 저장 역할은 유지·보완 |
+| S3 (격리 전용 버킷) | 악성 판정 파일 보관 (오탐 복원용), 서버 측 암호화(SSE) 적용 | 배포 아티팩트와 무관, 런타임 전용 |
+| 외부 위협 인텔리전스 | VirusTotal API, NVD/CVE 피드 | 우리가 운영하지 않는 외부 서비스. 탐지 엔진이 교차조회. 장애 시 정책은 7장 참고 |
+| Slack | 탐지 이벤트 알림 수신 | 탐지 엔진/API 서버가 Webhook으로 전송 |
+| IAM (인스턴스 프로파일) | EC2가 S3(격리 버킷)/RDS/ElastiCache 등 AWS 리소스에 접근할 권한 | 배포용 권한(CodeDeploy)은 더 이상 불필요 |
+| GitHub Actions | CI + SSH 배포 트리거 | 레퍼런스와 달리 빌드 아티팩트를 S3에 올리지 않고, SSH로 EC2에 직접 배포 명령 실행 |
 | Route53 | 도메인 → EC2 라우팅 | 레퍼런스와 동일 |
 
 ## 3. 트래픽/통신 흐름
 
 ```
 사용자 PC (로컬 에이전트/프록시)
-    │  HTTPS (파일 다운로드 요청, 응답 보류)
+    │  HTTPS/gRPC (파일 다운로드 요청, 응답 보류)
     ▼
-Route53 (도메인) → EC2:443 nginx (SSL 종료, Let's Encrypt)
-    │  리버스 프록시
+Route53 (도메인) → EC2:443 nginx (TLS 종료, gRPC 라우팅)
+    │
     ▼
-Spring Boot :8080 (검사 서버, WebFlux)
-    ├─→ Redis        : 블룸 필터 조회 → 캐시 히트 시 즉시 응답
-    ├─→ (캐시 미스 시) PE 분석 → YARA 매칭
-    ├─→ RDS MySQL    : 판정 이력 저장/조회
-    ├─→ S3 #2(격리)  : 악성 판정 시 파일 업로드
-    └─→ React :3000  : SSE로 차단 이벤트 실시간 push
+API 서버 :8080 (Spring Boot, WebFlux)
+    ├─→ ElastiCache(Redis) : 블룸 필터 조회 → 캐시 히트 시 즉시 응답
+    ├─→ (캐시 미스 시) 탐지 엔진에 위임 (동기 gRPC 호출)
+    │        └─→ 탐지 엔진: YARA 매칭·정책분석
+    │                ├─→ 외부 위협 인텔(VirusTotal, NVD/CVE) 교차조회
+    │                └─→ 악성 판정 시 Slack Webhook 알림
+    ├─→ RDS PostgreSQL : 판정 이력 저장/조회 + 화이트/블랙리스트 조회
+    └─→ S3(격리, SSE 암호화) : 악성 판정 시 파일 업로드
+
+관리 콘솔 (Vercel, React)
+    │  HTTPS (REST + SSE, 에이전트의 gRPC 채널과 별개)
+    ▼
+nginx → API 서버 :8080
+
+Prometheus (EC2)
+    │  스크레이핑
+    ▼
+API 서버 / 탐지 엔진 메트릭 → Grafana 대시보드
 ```
 
-- 에이전트 ↔ nginx 구간만 공인 도메인 HTTPS(443)를 사용하고, nginx → Spring Boot(8080)/React(3000)는
-  EC2 내부 통신이다.
-- 관리 콘솔(React)은 별도 API 게이트웨이 없이 검사 서버(Spring Boot)에 REST + SSE로 직접 접속한다.
-  단일 EC2·단일 백엔드 구조에서 게이트웨이를 추가하는 것은 YAGNI 위반이다.
-- Redis는 단일 인스턴스이므로 pub/sub 없이 Spring Boot 프로세스 내 SSE emitter로 실시간 이벤트를
-  처리한다. 다중 인스턴스로 스케일 아웃할 때만 pub/sub 레이어가 필요해진다.
+- 에이전트 ↔ nginx 구간은 gRPC(HTTP/2)를 쓰고, 관리 콘솔(Vercel) ↔ nginx 구간은 REST + SSE를 쓴다.
+  둘은 독립된 채널이라 프로토콜을 통일할 필요가 없다 — 관리 콘솔은 브라우저 환경이라 순수 gRPC를
+  못 쓰지만(gRPC-Web/Envoy 필요), 애초에 에이전트 채널과 무관하므로 REST를 그대로 쓰면 된다.
+- 탐지 엔진은 API 서버와 분리된 컨테이너지만 통신은 동기 gRPC + 세마포어로 유지한다 (메시지 브로커
+  미도입 — 상세: [`2026-09-12-detection-engine-broker-decision.md`](2026-09-12-detection-engine-broker-decision.md)).
+- ElastiCache는 관리형 단일 노드 기준이므로 pub/sub 없이 API 서버 프로세스 내 SSE emitter로 실시간
+  이벤트를 처리한다. 다중 인스턴스로 스케일 아웃할 때만 pub/sub 레이어가 필요해진다.
 
 ## 4. 배포 파이프라인 (CI/CD)
+
+레지스트리(ECR/GHCR) 없이, GitHub Actions가 EC2에 SSH로 접속해 직접 빌드/기동한다.
 
 ```
 로컬 (IntelliJ) → git push → GitHub (develop 브랜치)
     ▼
 GitHub Actions
-    ├─ Spring Boot: ./gradlew build → jar 생성
-    └─ React(관리 콘솔): npm run build → 정적 리소스 생성
+    ├─ (선택) 테스트/린트 실행
     ▼
-S3 #1 (배포용 버킷) 업로드
+SSH 접속 (Actions → EC2)
     ▼
-AWS IAM (배포 권한) ── CodeDeploy 트리거
-    ▼
-EC2 배포 (jar 교체 + 재기동, React 정적 파일 nginx 경로로 갱신)
+EC2 내부에서 실행:
+    git pull (최신 소스 반영)
+    docker compose build   # nginx, API 서버, 탐지 엔진, Prometheus/Grafana 이미지 빌드
+    docker compose up -d   # 컨테이너 재기동 (무중단은 범위 밖, 짧은 다운타임 허용)
 ```
 
-- 검사 서버(jar)와 관리 콘솔(정적 빌드)을 같은 워크플로우에서 빌드해 같은 S3 배포 버킷에 올리고,
-  CodeDeploy가 한 번에 배포한다.
+관리 콘솔(React)은 이 파이프라인 대상이 아니다 — Vercel이 별도로 자체 배포를 트리거한다
+(GitHub 저장소 연동 시 Vercel의 기본 배포 흐름을 그대로 사용, 별도 설정 불필요).
+
+- 이미지 빌드가 EC2 자체에서 일어나므로, 별도 레지스트리나 아티팩트 저장소(S3 배포 버킷)가 필요 없다.
+- 인증은 GitHub Actions에 등록한 SSH 개인키(Secrets)로 EC2에 접속하는 방식이며, IAM 기반 배포 권한
+  (CodeDeploy)은 더 이상 쓰지 않는다.
 - 로컬 에이전트는 이 파이프라인에서 제외한다 — 별도 배포 체계 없이 사용자 PC에서 수동/개별 실행되는
   박스로만 존재한다. (배포 자동화는 이번 설계 범위 밖)
-- 격리 전용 S3 버킷(#2)은 이 배포 파이프라인과 무관하게, 런타임에 검사 서버가 사용하는 별도 경로다.
+- 격리 전용 S3 버킷은 이 배포 파이프라인과 무관하게, 런타임에 검사 서버가 사용하는 별도 경로다.
+- 트레이드오프: EC2에서 직접 빌드하므로 빌드 시간 동안 EC2 CPU/메모리를 점유하고, 빌드 실패 시
+  롤백 전략이 없다(현재는 범위 밖). 트래픽/배포 빈도가 늘어나면 레지스트리 기반 배포로 전환을
+  재검토한다.
 
 ## 5. 장애/예외 처리 (인프라 관점)
 
@@ -103,10 +149,41 @@ EC2 배포 (jar 교체 + 재기동, React 정적 파일 nginx 경로로 갱신)
 - fail-open/fail-close 정책값은 관리 콘솔의 정책 편집 기능(제품 설계 문서 3장)을 통해 설정하며,
   이 설계 문서에서 별도 인프라 요소를 추가하지 않는다.
 
-## 6. 이번 설계에서 다루지 않는 것 (Out of scope)
+## 6. 모니터링
+
+- **Prometheus + Grafana**를 EC2 Docker Compose에 컨테이너로 추가한다 (관리형 서비스 아님, 별도
+  인스턴스 아님 — 현재 규모에서는 같은 EC2에 컨테이너로 두는 것으로 충분).
+- Prometheus가 API 서버/탐지 엔진의 메트릭 엔드포인트(Spring Boot Actuator + Micrometer)를
+  스크레이핑하고, Grafana가 이를 대시보드로 시각화한다.
+- 관리 콘솔(Vercel)의 "성능 지표" 요구사항(제품 설계 문서 3장)은 이 Grafana 대시보드를 iframe
+  임베드하거나 별도 조회 API로 노출하는 방식 중 택 1 — 세부 방식은 구현 단계에서 결정한다.
+
+## 7. 외부 위협 인텔리전스 연동
+
+- 탐지 엔진이 YARA/PE 분석과 별개로 **VirusTotal API**, **NVD/CVE 피드**와 해시/시그니처를
+  교차조회한다.
+- **장애/지연 정책(신규 보완, 팀원 공유 필요)**: 팀원 제안 다이어그램에는 이 외부 연동이
+  느려지거나 rate limit에 걸렸을 때의 동작이 명시돼 있지 않았다. 로컬 탐지 서버 장애 정책(5장)과
+  같은 원칙을 적용해 **fail-open**으로 기본값을 정한다 — 외부 조회가 타임아웃되면 로컬 YARA/PE
+  분석 결과만으로 판정하고, 외부 조회 결과는 비동기로 나중에 도착하면 이력에 보강 정보로만 추가한다.
+  즉 외부 위협 인텔은 판정을 막는 필수 의존성이 아니라 보강 신호로 취급한다.
+- API 키/인증 정보는 EC2 환경변수 또는 AWS Secrets Manager로 관리한다 (구현 단계에서 결정).
+
+## 8. 알림 (Slack)
+
+- 악성 판정 시 탐지 엔진(또는 API 서버)이 Slack Webhook으로 알림을 전송한다.
+- 실시간 SSE(관리 콘솔용)와는 별개 채널이다 — SSE는 콘솔을 보고 있는 사람에게, Slack은 보고 있지
+  않아도 알 수 있게 하는 용도로 역할이 다르다.
+- Webhook URL도 API 키와 마찬가지로 환경변수/Secrets Manager로 관리한다.
+
+## 9. 이번 설계에서 다루지 않는 것 (Out of scope)
 
 - 로컬 에이전트의 설치/배포/자동 업데이트 파이프라인 — 필요 시 별도 설계로 분리
-- 모니터링/로그 수집 인프라 (CloudWatch 등 구체 도구 선정) — 필요 시 별도 설계로 분리
 - 다중 EC2/오토스케일링, Redis pub/sub 등 스케일 아웃 구성 — 현재는 단일 인스턴스 기준
 - 제품 기능 자체(PE 분석, YARA 룰, 블룸 필터 파라미터 산출 등)는 `프록시-악성코드-탐지-플랫폼.md`
   범위이며 이 문서에서 다루지 않음
+- API 서버 ↔ 탐지 엔진 사이 메시지 브로커 도입 여부 — 도입 기준과 트리거 조건은
+  [`2026-09-12-detection-engine-broker-decision.md`](2026-09-12-detection-engine-broker-decision.md)
+  참고. 현재는 동기 gRPC + 세마포어로 유지
+- Grafana 대시보드를 관리 콘솔에 노출하는 구체적 방식(임베드 vs API) — 구현 단계에서 결정
+- 외부 위협 인텔 API 키/Slack Webhook 등 시크릿 관리 방식의 세부 구현 — 구현 단계에서 결정
