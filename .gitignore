@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# IntelliJ
+.idea/
+
+# oh-my-claudecode runtime state
+.omc/
