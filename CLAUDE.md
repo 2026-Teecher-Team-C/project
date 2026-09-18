@@ -60,8 +60,10 @@ final file placement.
   headers go out, trading off against timeout/UX behavior.
 - **Local vs. server boundary is a 3-stage pipeline** (local filter → hash lookup → conditional
   upload) specifically to avoid doubling bandwidth by uploading every file in full.
-- **Failure policy for the inspection server is fail-open vs. fail-close**, mitigated via circuit
-  breaker + local cache fallback — don't hardcode a single failure behavior.
+- **Failure policy for the inspection server is fixed fail-close** (2026-09-18 decision). When the
+  inspection server is unreachable, downloads are blocked — there is no fail-open option, no policy
+  toggle, and no circuit-breaker/local-cache mitigation. Do not reintroduce a configurable failure
+  mode. The accepted cost is that an inspection-server outage stops downloads entirely.
 - **Bloom filters can't delete entries**, so false-positive restoration/whitelisting must be a
   separate layer from the bloom filter, not a mutation of it.
 - Out of scope by design (do not attempt to "fix"): QUIC/HTTP3 traffic, pinned apps, programs that
