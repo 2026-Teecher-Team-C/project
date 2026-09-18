@@ -11,8 +11,8 @@
 --   2) [2] ALTER / [3] INDEX / [4] COMMENT 섹션은 다이어그램에 필요 없다.
 --      툴이 파싱 에러를 내면 이 세 섹션을 제외하고 [1]만 넣으면 된다.
 --   3) 툴이 아래 타입을 못 읽으면 치환해도 ERD 구조는 동일하다:
---        TIMESTAMPTZ -> TIMESTAMP     JSONB -> TEXT
---        INET        -> VARCHAR(45)   UUID  -> CHAR(36)
+--        TIMESTAMPTZ -> TIMESTAMP     INET -> VARCHAR(45)
+--        UUID        -> CHAR(36)
 --      실제 DB 적용 시에는 치환하지 말고 원본 타입을 쓸 것.
 -- ============================================================================
 
@@ -23,7 +23,7 @@
 
 -- 1. 관리자 계정 (관리 콘솔)
 CREATE TABLE admin_users (
-    user_id       UUID         NOT NULL,
+    admin_id      UUID         NOT NULL,
     username      VARCHAR(64)  NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     role          VARCHAR(16)  NOT NULL DEFAULT 'VIEWER',
@@ -31,7 +31,7 @@ CREATE TABLE admin_users (
     last_login_at TIMESTAMPTZ,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    CONSTRAINT pk_admin_users PRIMARY KEY (user_id),
+    CONSTRAINT pk_admin_users PRIMARY KEY (admin_id),
     CONSTRAINT uq_admin_users_username UNIQUE (username),
     CONSTRAINT ck_admin_users_role CHECK (role IN ('ADMIN','ANALYST','VIEWER'))
 );
@@ -54,7 +54,6 @@ CREATE TABLE agents (
 
 -- 3. YARA 룰셋 버전 (활성 룰셋은 항상 1개 — [3] 섹션의 부분 유니크 인덱스로 강제)
 CREATE TABLE yara_rulesets (
-    ruleset_id   UUID        NOT NULL,
     version      INTEGER     NOT NULL,
     rule_count   INTEGER     NOT NULL DEFAULT 0,
     is_active    BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -62,24 +61,23 @@ CREATE TABLE yara_rulesets (
     activated_by UUID,
     notes        TEXT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT pk_yara_rulesets PRIMARY KEY (ruleset_id),
-    CONSTRAINT uq_yara_rulesets_version UNIQUE (version),
+    CONSTRAINT pk_yara_rulesets PRIMARY KEY (version),
     CONSTRAINT fk_yara_rulesets_activated_by FOREIGN KEY (activated_by)
-        REFERENCES admin_users (user_id)
+        REFERENCES admin_users (admin_id)
 );
 
 -- 4. 개별 YARA 룰
 CREATE TABLE yara_rules (
-    rule_id    UUID         NOT NULL,
-    ruleset_id UUID         NOT NULL,
-    rule_name  VARCHAR(128) NOT NULL,
-    severity   VARCHAR(16)  NOT NULL DEFAULT 'MEDIUM',
-    enabled    BOOLEAN      NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    rule_id         UUID         NOT NULL,
+    ruleset_version INTEGER      NOT NULL,
+    rule_name       VARCHAR(128) NOT NULL,
+    severity        VARCHAR(16)  NOT NULL DEFAULT 'MEDIUM',
+    enabled         BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
     CONSTRAINT pk_yara_rules PRIMARY KEY (rule_id),
-    CONSTRAINT uq_yara_rules_name UNIQUE (ruleset_id, rule_name),
-    CONSTRAINT fk_yara_rules_ruleset FOREIGN KEY (ruleset_id)
-        REFERENCES yara_rulesets (ruleset_id) ON DELETE CASCADE,
+    CONSTRAINT uq_yara_rules_name UNIQUE (ruleset_version, rule_name),
+    CONSTRAINT fk_yara_rules_ruleset FOREIGN KEY (ruleset_version)
+        REFERENCES yara_rulesets (version) ON DELETE CASCADE,
     CONSTRAINT ck_yara_rules_severity CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL'))
 );
 
@@ -92,15 +90,15 @@ CREATE TABLE file_verdicts (
     detected_file_type VARCHAR(32),
     verdict            VARCHAR(16) NOT NULL,
     verdict_source     VARCHAR(16) NOT NULL,
-    ruleset_id         UUID,
+    ruleset_version    INTEGER,
     is_stale           BOOLEAN     NOT NULL DEFAULT FALSE,
     analysis_count     INTEGER     NOT NULL DEFAULT 0,
     hit_count          BIGINT      NOT NULL DEFAULT 0,
     first_seen_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_verdict_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT pk_file_verdicts PRIMARY KEY (sha256),
-    CONSTRAINT fk_file_verdicts_ruleset FOREIGN KEY (ruleset_id)
-        REFERENCES yara_rulesets (ruleset_id),
+    CONSTRAINT fk_file_verdicts_ruleset FOREIGN KEY (ruleset_version)
+        REFERENCES yara_rulesets (version),
     CONSTRAINT ck_file_verdicts_verdict
         CHECK (verdict IN ('CLEAN','MALICIOUS','SUSPICIOUS','UNKNOWN','ERROR')),
     CONSTRAINT ck_file_verdicts_source
@@ -136,7 +134,7 @@ CREATE TABLE download_events (
     CONSTRAINT ck_download_events_pipeline CHECK (pipeline_status IN
         ('HELD','HASHED','LOOKUP','UPLOADED','ANALYZING','COMPLETED','FAILED')),
     CONSTRAINT ck_download_events_decision CHECK (decision IN
-        ('RELEASED','BLOCKED','BYPASSED','FAIL_OPEN','FAIL_CLOSE')),
+        ('RELEASED','BLOCKED','BYPASSED','FAIL_CLOSE')),
     CONSTRAINT ck_download_events_decision_source CHECK (decision_source IN
         ('WHITELIST','BLACKLIST','CACHE','ENGINE','POLICY','FALLBACK')),
     CONSTRAINT ck_download_events_completed
@@ -150,7 +148,7 @@ CREATE TABLE analyses (
     analysis_id         UUID        NOT NULL,
     sha256              CHAR(64)    NOT NULL,
     event_id            UUID,
-    ruleset_id          UUID,
+    ruleset_version     INTEGER,
     engine_version      VARCHAR(32) NOT NULL,
     status              VARCHAR(16) NOT NULL,
     verdict             VARCHAR(16) NOT NULL,
@@ -165,8 +163,8 @@ CREATE TABLE analyses (
         REFERENCES file_verdicts (sha256),
     CONSTRAINT fk_analyses_event FOREIGN KEY (event_id)
         REFERENCES download_events (event_id),
-    CONSTRAINT fk_analyses_ruleset FOREIGN KEY (ruleset_id)
-        REFERENCES yara_rulesets (ruleset_id),
+    CONSTRAINT fk_analyses_ruleset FOREIGN KEY (ruleset_version)
+        REFERENCES yara_rulesets (version),
     CONSTRAINT ck_analyses_status
         CHECK (status IN ('SUCCESS','TIMEOUT','CRASH','OOM','UNSUPPORTED')),
     CONSTRAINT ck_analyses_verdict
@@ -180,7 +178,7 @@ CREATE TABLE analysis_matches (
     rule_id         UUID,
     rule_name       VARCHAR(128) NOT NULL,
     severity        VARCHAR(16)  NOT NULL,
-    matched_strings JSONB,
+    matched_strings TEXT,          -- JSON 문자열. 상한을 걸어 저장할 것 (매칭 폭탄 방지)
     CONSTRAINT pk_analysis_matches PRIMARY KEY (match_id),
     CONSTRAINT uq_analysis_matches UNIQUE (analysis_id, rule_name),
     CONSTRAINT fk_analysis_matches_analysis FOREIGN KEY (analysis_id)
@@ -202,7 +200,7 @@ CREATE TABLE hash_blacklist (
     deactivated_at TIMESTAMPTZ,
     CONSTRAINT pk_hash_blacklist PRIMARY KEY (hash_type, hash_value),
     CONSTRAINT fk_hash_blacklist_added_by FOREIGN KEY (added_by)
-        REFERENCES admin_users (user_id),
+        REFERENCES admin_users (admin_id),
     CONSTRAINT ck_hash_blacklist_type CHECK (hash_type IN ('SHA256','TLSH')),
     CONSTRAINT ck_hash_blacklist_severity
         CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL'))
@@ -222,7 +220,7 @@ CREATE TABLE hash_whitelist (
     created_at           TIMESTAMPTZ  NOT NULL DEFAULT now(),
     CONSTRAINT pk_hash_whitelist PRIMARY KEY (hash_type, hash_value),
     CONSTRAINT fk_hash_whitelist_added_by FOREIGN KEY (added_by)
-        REFERENCES admin_users (user_id),
+        REFERENCES admin_users (admin_id),
     CONSTRAINT ck_hash_whitelist_type CHECK (hash_type IN ('SHA256','TLSH'))
     -- origin_quarantine_id -> quarantine_files FK는 [2] 섹션에서 추가 (순환 참조 회피)
 );
@@ -253,7 +251,7 @@ CREATE TABLE quarantine_files (
     CONSTRAINT fk_quarantine_files_agent FOREIGN KEY (agent_id)
         REFERENCES agents (agent_id),
     CONSTRAINT fk_quarantine_files_restored_by FOREIGN KEY (restored_by)
-        REFERENCES admin_users (user_id),
+        REFERENCES admin_users (admin_id),
     CONSTRAINT ck_quarantine_files_status
         CHECK (status IN ('QUARANTINED','RESTORED','DELETED','EXPIRED')),
     -- 복원 상태면 누가·언제 복원했는지가 반드시 있어야 한다
@@ -261,20 +259,7 @@ CREATE TABLE quarantine_files (
         CHECK (status <> 'RESTORED' OR (restored_at IS NOT NULL AND restored_by IS NOT NULL))
 );
 
--- 12. 전역 정책값 (fail-open/fail-close, 보류 타임아웃 등)
-CREATE TABLE policy_settings (
-    policy_key   VARCHAR(64) NOT NULL,
-    policy_value JSONB       NOT NULL,
-    description  TEXT,
-    updated_by   UUID,
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    revision     INTEGER     NOT NULL DEFAULT 1,
-    CONSTRAINT pk_policy_settings PRIMARY KEY (policy_key),
-    CONSTRAINT fk_policy_settings_updated_by FOREIGN KEY (updated_by)
-        REFERENCES admin_users (user_id)
-);
-
--- 13. 바이패스 도메인 (인증서 피닝 앱 등)
+-- 12. 바이패스 도메인 (인증서 피닝 앱 등)
 CREATE TABLE bypass_domains (
     bypass_id      UUID         NOT NULL,
     domain_pattern VARCHAR(255) NOT NULL,
@@ -285,10 +270,10 @@ CREATE TABLE bypass_domains (
     CONSTRAINT pk_bypass_domains PRIMARY KEY (bypass_id),
     CONSTRAINT uq_bypass_domains_pattern UNIQUE (domain_pattern),
     CONSTRAINT fk_bypass_domains_created_by FOREIGN KEY (created_by)
-        REFERENCES admin_users (user_id)
+        REFERENCES admin_users (admin_id)
 );
 
--- 14. 파일 타입별 검사 정책 (검사 수준 + "N MB 초과 파일 정책")
+-- 13. 파일 타입별 검사 정책 (검사 수준 + "N MB 초과 파일 정책")
 CREATE TABLE file_type_policies (
     file_type_policy_id    UUID        NOT NULL,
     file_type              VARCHAR(32) NOT NULL,
@@ -301,14 +286,14 @@ CREATE TABLE file_type_policies (
     CONSTRAINT pk_file_type_policies PRIMARY KEY (file_type_policy_id),
     CONSTRAINT uq_file_type_policies_type UNIQUE (file_type),
     CONSTRAINT fk_file_type_policies_updated_by FOREIGN KEY (updated_by)
-        REFERENCES admin_users (user_id),
+        REFERENCES admin_users (admin_id),
     CONSTRAINT ck_file_type_policies_level
         CHECK (inspection_level IN ('NONE','HASH_ONLY','FULL')),
     CONSTRAINT ck_file_type_policies_oversize
         CHECK (oversize_action IN ('PASS','BLOCK','WARN'))
 );
 
--- 15. 캐시 무효화 채널 (서버 -> Redis / 에이전트)
+-- 14. 캐시 무효화 채널 (서버 -> Redis / 에이전트)
 CREATE TABLE cache_invalidations (
     invalidation_id UUID        NOT NULL,
     target_type     VARCHAR(16) NOT NULL,
@@ -318,24 +303,24 @@ CREATE TABLE cache_invalidations (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT pk_cache_invalidations PRIMARY KEY (invalidation_id),
     CONSTRAINT fk_cache_invalidations_created_by FOREIGN KEY (created_by)
-        REFERENCES admin_users (user_id),
+        REFERENCES admin_users (admin_id),
     CONSTRAINT ck_cache_invalidations_target
         CHECK (target_type IN ('HASH','RULESET','ALL'))
 );
 
--- 16. 감사 로그 (관리자 행위 추적)
+-- 15. 감사 로그 (관리자 행위 추적)
 CREATE TABLE audit_logs (
     log_id      BIGSERIAL   NOT NULL,
     actor_id    UUID,
     action      VARCHAR(48) NOT NULL,
     target_type VARCHAR(32) NOT NULL,
     target_id   VARCHAR(128),
-    detail      JSONB,
+    detail      TEXT,        -- JSON 문자열
     ip_address  INET,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT pk_audit_logs PRIMARY KEY (log_id),
     CONSTRAINT fk_audit_logs_actor FOREIGN KEY (actor_id)
-        REFERENCES admin_users (user_id)
+        REFERENCES admin_users (admin_id)
 );
 
 
@@ -396,7 +381,6 @@ COMMENT ON TABLE analysis_matches    IS '매칭된 YARA 룰 (차단 사유)';
 COMMENT ON TABLE hash_blacklist      IS '알려진 악성 해시';
 COMMENT ON TABLE hash_whitelist      IS '오탐 복원/예외 해시 (블룸 필터 앞단 레이어)';
 COMMENT ON TABLE quarantine_files    IS 'S3 격리 보관 및 복원 상태';
-COMMENT ON TABLE policy_settings     IS '전역 정책값 (fail-open/close 등)';
 COMMENT ON TABLE bypass_domains      IS '검사 바이패스 도메인';
 COMMENT ON TABLE file_type_policies  IS '파일 타입별 검사 수준 및 크기 초과 정책';
 COMMENT ON TABLE cache_invalidations IS '캐시 무효화 채널 (서버 -> Redis/에이전트)';

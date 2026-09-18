@@ -23,10 +23,10 @@
 | 격리 파일 저장 | `storage_path` (모호) | **S3 버킷 + 키** (배포 문서 확정 사항 반영) |
 | 화이트리스트 | 없음 | `hash_whitelist` (블룸 필터 앞단 별도 레이어) |
 | YARA 룰/룰셋 | 없음 | `yara_rulesets` + `yara_rules` + `analysis_matches` |
-| 정책(바이패스·검사수준) | 없음 | `policy_settings` + `bypass_domains` + `file_type_policies` |
+| 정책(바이패스·검사수준) | 없음 | `bypass_domains` + `file_type_policies` |
 | 오탐 복원 | 기록 불가 | `quarantine_files.status/restored_by/restored_at` |
 | `admin_users` 연결 | FK 0개(고립) | 복원·리스트·정책·룰셋·감사로그에 연결 |
-| 테이블 수 | 7 | 16 (서버 RDS만. 에이전트 측 DB 없음 — 5장) |
+| 테이블 수 | 7 | 15 (서버 RDS만. 에이전트 측 DB 없음 — 5장) |
 
 ---
 
@@ -63,7 +63,7 @@
 
 ### 누락
 
-11. 정책 테이블 전무 (파일 타입별 검사 수준, 바이패스 도메인, fail-open/close 정책값, N MB 초과 정책)
+11. 정책 테이블 전무 (파일 타입별 검사 수준, 바이패스 도메인, 보류 타임아웃, N MB 초과 정책)
 12. 성능 지표용 타임스탬프 없음 — p99 지연·오버헤드·캐시 히트율을 집계할 컬럼이 없다
 13. 격리 파일 메타데이터 부족 (원본 파일명, 해시, 소유 에이전트, 보관 만료일)
 14. `blacklist`에 해시 알고리즘 구분 없음 (제품 설계 9장의 TLSH 퍼지 해싱 확장 불가)
@@ -89,7 +89,6 @@ erDiagram
     admin_users     ||--o{ hash_whitelist      : "등록"
     admin_users     ||--o{ hash_blacklist      : "등록"
     admin_users     ||--o{ yara_rulesets       : "활성화"
-    admin_users     ||--o{ policy_settings     : "수정"
     admin_users     ||--o{ bypass_domains      : "관리"
     admin_users     ||--o{ file_type_policies  : "수정"
     admin_users     ||--o{ cache_invalidations : "발행"
@@ -129,11 +128,10 @@ erDiagram
 | 9 | `hash_blacklist` | 알려진 악성 해시 | 1주차 |
 | 10 | `hash_whitelist` | 오탐 복원·예외 (블룸 필터 앞단) | 3주차 |
 | 11 | `quarantine_files` | S3 격리 보관 + 복원 상태 | 2주차 |
-| 12 | `policy_settings` | fail-open/close, 전역 정책값 | 4주차 |
-| 13 | `bypass_domains` | 바이패스 도메인 | 3주차 |
-| 14 | `file_type_policies` | 타입별 검사 수준, N MB 초과 정책 | 4주차 |
-| 15 | `cache_invalidations` | 캐시 무효화 채널 (서버 → Redis/에이전트) | 4주차 |
-| 16 | `audit_logs` | 관리자 행위 감사 | 3주차 |
+| 12 | `bypass_domains` | 바이패스 도메인 | 3주차 |
+| 13 | `file_type_policies` | 타입별 검사 수준, N MB 초과 정책 | 4주차 |
+| 14 | `cache_invalidations` | 캐시 무효화 채널 (서버 → Redis/에이전트) | 4주차 |
+| 15 | `audit_logs` | 관리자 행위 감사 | 3주차 |
 
 > `spool_files`는 서버 스키마에서 **삭제**한다. 에이전트 인메모리 상태로만 관리하며, 이를 대체할
 > 로컬 DB를 두지 않는다 (5장 참고).
@@ -153,7 +151,7 @@ erDiagram
 -- 1. 관리자
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE admin_users (
-    user_id       UUID         PRIMARY KEY,
+    admin_id      UUID         PRIMARY KEY,
     username      VARCHAR(64)  NOT NULL UNIQUE,
     password_hash VARCHAR(255) NOT NULL,
     role          VARCHAR(16)  NOT NULL DEFAULT 'VIEWER'
@@ -187,12 +185,11 @@ CREATE INDEX idx_agents_heartbeat ON agents (last_heartbeat_at DESC)
 -- 3-4. YARA 룰셋 / 룰
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE yara_rulesets (
-    ruleset_id   UUID        PRIMARY KEY,
-    version      INTEGER     NOT NULL UNIQUE,
+    version      INTEGER     PRIMARY KEY,
     rule_count   INTEGER     NOT NULL DEFAULT 0,
     is_active    BOOLEAN     NOT NULL DEFAULT FALSE,
     activated_at TIMESTAMPTZ,
-    activated_by UUID        REFERENCES admin_users(user_id),
+    activated_by UUID        REFERENCES admin_users(admin_id),
     notes        TEXT,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -202,13 +199,13 @@ CREATE UNIQUE INDEX uq_yara_rulesets_active ON yara_rulesets (is_active)
 
 CREATE TABLE yara_rules (
     rule_id    UUID         PRIMARY KEY,
-    ruleset_id UUID         NOT NULL REFERENCES yara_rulesets(ruleset_id) ON DELETE CASCADE,
+    ruleset_version INTEGER NOT NULL REFERENCES yara_rulesets(version) ON DELETE CASCADE,
     rule_name  VARCHAR(128) NOT NULL,
     severity   VARCHAR(16)  NOT NULL DEFAULT 'MEDIUM'
                             CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL')),
     enabled    BOOLEAN      NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    UNIQUE (ruleset_id, rule_name)
+    UNIQUE (ruleset_version, rule_name)
 );
 
 -- ─────────────────────────────────────────────────────────
@@ -223,7 +220,7 @@ CREATE TABLE file_verdicts (
                                    CHECK (verdict IN ('CLEAN','MALICIOUS','SUSPICIOUS','UNKNOWN','ERROR')),
     verdict_source     VARCHAR(16) NOT NULL
                                    CHECK (verdict_source IN ('WHITELIST','BLACKLIST','ENGINE','MANUAL')),
-    ruleset_id         UUID        REFERENCES yara_rulesets(ruleset_id),  -- 리스트 판정이면 NULL
+    ruleset_version    INTEGER     REFERENCES yara_rulesets(version),  -- 리스트 판정이면 NULL
     is_stale           BOOLEAN     NOT NULL DEFAULT FALSE,  -- 룰셋 갱신/오탐 복원으로 무효화됨
     analysis_count     INTEGER     NOT NULL DEFAULT 0,
     hit_count          BIGINT      NOT NULL DEFAULT 0,      -- 캐시 히트율 집계용
@@ -254,7 +251,7 @@ CREATE TABLE download_events (
                                        ('HELD','HASHED','LOOKUP','UPLOADED','ANALYZING','COMPLETED','FAILED')),
     -- 최종 처분 (= "어떻게 됐나") — pipeline_status와 역할이 겹치지 않는다
     decision            VARCHAR(16)  CHECK (decision IN
-                                       ('RELEASED','BLOCKED','BYPASSED','FAIL_OPEN','FAIL_CLOSE')),
+                                       ('RELEASED','BLOCKED','BYPASSED','FAIL_CLOSE')),
     decision_source     VARCHAR(16)  CHECK (decision_source IN
                                        ('WHITELIST','BLACKLIST','CACHE','ENGINE','POLICY','FALLBACK')),
     cache_hit           BOOLEAN,                    -- 캐시 히트율 집계
@@ -279,7 +276,7 @@ CREATE TABLE analyses (
     analysis_id         UUID        PRIMARY KEY,
     sha256              CHAR(64)    NOT NULL REFERENCES file_verdicts(sha256),
     event_id            UUID        REFERENCES download_events(event_id),  -- 룰셋 갱신 재검사는 NULL
-    ruleset_id          UUID        REFERENCES yara_rulesets(ruleset_id),
+    ruleset_version     INTEGER     REFERENCES yara_rulesets(version),
     engine_version      VARCHAR(32) NOT NULL,
     status              VARCHAR(16) NOT NULL
                                     CHECK (status IN ('SUCCESS','TIMEOUT','CRASH','OOM','UNSUPPORTED')),
@@ -300,7 +297,7 @@ CREATE TABLE analysis_matches (
     rule_id         UUID         REFERENCES yara_rules(rule_id),  -- 룰 삭제돼도 이름은 남김
     rule_name       VARCHAR(128) NOT NULL,
     severity        VARCHAR(16)  NOT NULL,
-    matched_strings JSONB,
+    matched_strings TEXT,          -- JSON 문자열 (이식성 위해 JSONB 대신 TEXT)
     UNIQUE (analysis_id, rule_name)
 );
 
@@ -316,7 +313,7 @@ CREATE TABLE hash_blacklist (
     severity       VARCHAR(16)  NOT NULL DEFAULT 'HIGH'
                                 CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL')),
     source         VARCHAR(32)  NOT NULL DEFAULT 'MANUAL',
-    added_by       UUID         REFERENCES admin_users(user_id),
+    added_by       UUID         REFERENCES admin_users(admin_id),
     is_active      BOOLEAN      NOT NULL DEFAULT TRUE,   -- 삭제 대신 비활성화 (이력 보존)
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
     deactivated_at TIMESTAMPTZ,
@@ -329,7 +326,7 @@ CREATE TABLE hash_whitelist (
     hash_value           VARCHAR(128) NOT NULL,
     reason               TEXT         NOT NULL,
     origin_quarantine_id UUID,                          -- 오탐 복원에서 파생된 경우 (FK는 11번 뒤에 추가)
-    added_by             UUID         NOT NULL REFERENCES admin_users(user_id),
+    added_by             UUID         NOT NULL REFERENCES admin_users(admin_id),
     is_active            BOOLEAN      NOT NULL DEFAULT TRUE,
     expires_at           TIMESTAMPTZ,
     created_at           TIMESTAMPTZ  NOT NULL DEFAULT now(),
@@ -353,7 +350,7 @@ CREATE TABLE quarantine_files (
     quarantined_at    TIMESTAMPTZ   NOT NULL DEFAULT now(),
     expires_at        TIMESTAMPTZ,                      -- 보관 만료 (S3 수명주기와 동기)
     restored_at       TIMESTAMPTZ,
-    restored_by       UUID          REFERENCES admin_users(user_id),
+    restored_by       UUID          REFERENCES admin_users(admin_id),
     restore_reason    TEXT,
     UNIQUE (s3_bucket, s3_key),
     -- 복원 상태면 누가·언제 복원했는지가 반드시 있어야 한다
@@ -365,23 +362,14 @@ ALTER TABLE hash_whitelist
     FOREIGN KEY (origin_quarantine_id) REFERENCES quarantine_files(quarantine_id);
 
 -- ─────────────────────────────────────────────────────────
--- 12-14. 정책
+-- 12-13. 정책
 -- ─────────────────────────────────────────────────────────
-CREATE TABLE policy_settings (
-    policy_key   VARCHAR(64) PRIMARY KEY,   -- 'failure_mode', 'hold_timeout_ms', ...
-    policy_value JSONB       NOT NULL,      -- {"mode":"fail_close"}
-    description  TEXT,
-    updated_by   UUID        REFERENCES admin_users(user_id),
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    revision     INTEGER     NOT NULL DEFAULT 1
-);
-
 CREATE TABLE bypass_domains (
     bypass_id      UUID         PRIMARY KEY,
     domain_pattern VARCHAR(255) NOT NULL UNIQUE,
     reason         TEXT         NOT NULL,   -- 인증서 피닝 앱 등
     is_active      BOOLEAN      NOT NULL DEFAULT TRUE,
-    created_by     UUID         REFERENCES admin_users(user_id),
+    created_by     UUID         REFERENCES admin_users(admin_id),
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
@@ -394,7 +382,7 @@ CREATE TABLE file_type_policies (
     oversize_action        VARCHAR(16) NOT NULL DEFAULT 'BLOCK'
                                        CHECK (oversize_action IN ('PASS','BLOCK','WARN')),
     is_active              BOOLEAN     NOT NULL DEFAULT TRUE,
-    updated_by             UUID        REFERENCES admin_users(user_id),
+    updated_by             UUID        REFERENCES admin_users(admin_id),
     updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -407,7 +395,7 @@ CREATE TABLE cache_invalidations (
                                  CHECK (target_type IN ('HASH','RULESET','ALL')),
     target_value    VARCHAR(128),               -- target_type='ALL'이면 NULL
     reason          TEXT         NOT NULL,
-    created_by      UUID         REFERENCES admin_users(user_id),
+    created_by      UUID         REFERENCES admin_users(admin_id),
     created_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_invalidations_created ON cache_invalidations (created_at DESC);
@@ -417,11 +405,11 @@ CREATE INDEX idx_invalidations_created ON cache_invalidations (created_at DESC);
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE audit_logs (
     log_id      BIGSERIAL    PRIMARY KEY,
-    actor_id    UUID         REFERENCES admin_users(user_id),
+    actor_id    UUID         REFERENCES admin_users(admin_id),
     action      VARCHAR(48)  NOT NULL,   -- 'RESTORE_QUARANTINE', 'ADD_WHITELIST', ...
     target_type VARCHAR(32)  NOT NULL,
     target_id   VARCHAR(128),
-    detail      JSONB,
+    detail      TEXT,        -- JSON 문자열
     ip_address  INET,
     created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
@@ -476,7 +464,7 @@ SELECT hash_value FROM hash_blacklist WHERE hash_type = 'SHA256' AND is_active;
 
 ```
 새 룰셋 활성화 (yara_rulesets.is_active 전환)
-  → file_verdicts WHERE ruleset_id = <이전 룰셋> SET is_stale = TRUE
+  → UPDATE file_verdicts SET is_stale = TRUE WHERE ruleset_version < <새 버전>   (조인 없음)
   → cache_invalidations INSERT (RULESET)
   → 이후 같은 해시가 다시 들어오면 캐시 미스로 재검사 → analyses 행이 하나 더 쌓임
 ```
@@ -507,8 +495,8 @@ SELECT hash_value FROM hash_blacklist WHERE hash_type = 'SHA256' AND is_active;
 2026-09-15 팀 결정으로 **서킷 브레이커와 로컬 SQLite 캐시 폴백을 세트로 제외**했다
 ([`2026-09-12-decisions-to-communicate.md`](2026-09-12-decisions-to-communicate.md) 4번). 근거는 그 문서에
 적힌 그대로다 — 로컬 캐시의 유일한 용도가 서킷브레이커 OPEN 이후의 폴백인데, 서킷브레이커를 빼면
-캐시가 쓰일 트리거 조건이 사라진다. 서버 장애 시에는 캐시 조회 없이 정책값(fail-open/fail-close)만
-즉시 적용한다.
+캐시가 쓰일 트리거 조건이 사라진다. 서버 장애 시에는 캐시 조회 없이 **즉시 차단**한다
+(fail-close 고정, 2026-09-18 결정).
 
 따라서 에이전트에 DB를 되살릴 이유가 남아 있지 않다. 오히려 없는 편이 제품 설계 7장의 목표
 ("로컬 에이전트의 공격 표면 최소화")에 더 부합한다 — 엔드포인트에 DB 파일도, 그 파일을 읽는 파서도
@@ -526,7 +514,7 @@ DB가 필요해 보이는 유일한 후보가 "스풀 파일 추적"인데, **�
 - 고아 스풀 파일 정리도 DB가 필요 없다 — 기동 직후에는 살아 있는 flow가 있을 수 없으므로,
   **스풀 디렉터리의 `*.tmp`를 전부 삭제**하면 된다.
 
-정책값(바이패스 도메인, 검사 수준, fail-open/close)도 기동 시 서버에서 받아 **메모리에 보관**한다.
+정책값(바이패스 도메인, 검사 수준, 보류 타임아웃)도 기동 시 서버에서 받아 **메모리에 보관**한다.
 서버에 닿지 못하면 설정 파일의 기본값을 쓴다 (초기 단계에는 관리 콘솔이 없어 정책값이 설정 파일로
 관리되는 것과 일치 — 배포 아키텍처 문서 5장).
 
@@ -558,7 +546,7 @@ DB가 필요해 보이는 유일한 후보가 "스풀 파일 추적"인데, **�
 ## 7. MVP(4일)에서 실제로 필요한 최소 집합
 
 [`2026-09-13-mvp-scope.md`](2026-09-13-mvp-scope.md)는 관리 콘솔·오탐 복원·정식 RDS 스키마를 모두
-제외했다. 위 16개 테이블 중 MVP에 실제로 필요한 것은 4개뿐이다.
+제외했다. 위 15개 테이블 중 MVP에 실제로 필요한 것은 4개뿐이다.
 
 ```
 agents  ·  download_events  ·  file_verdicts  ·  hash_blacklist
