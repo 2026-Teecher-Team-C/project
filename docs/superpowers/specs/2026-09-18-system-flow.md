@@ -281,7 +281,7 @@ S3에 남는 것은 악성 판정된 것뿐이다.
   → quarantine_files.status = 'RESTORED', restored_by/restored_at 기록
   → hash_whitelist INSERT (origin_quarantine_id로 출처 연결)
   → file_verdicts.is_stale = TRUE
-  → cache_invalidations INSERT (HASH)
+  → Redis 해시 캐시 직접 삭제 (에이전트는 판정을 캐시하지 않아 통지 불필요)
   → audit_logs INSERT
 ```
 
@@ -292,13 +292,13 @@ S3에 남는 것은 악성 판정된 것뿐이다.
 
 ```
 새 룰셋 활성화 (yara_rulesets.is_active 전환)
-  → UPDATE file_verdicts SET is_stale = TRUE WHERE ruleset_version < <새 버전>
-  → cache_invalidations INSERT (RULESET)
+  → UPDATE file_verdicts SET is_stale = TRUE WHERE rulesets_version < <새 버전>
+  → Redis 블룸 필터·해시 캐시 직접 삭제
   → 같은 해시가 다시 들어오면 캐시 미스로 재검사 → analyses 행이 하나 더 쌓임
 ```
 
 "안전" 판정의 의미가 **"내가 가진 룰 전부와 대조했는데 안 걸렸다"**이므로, 룰셋이 바뀌면 이전 "안전"
-판정은 보장되지 않는다. 그래서 판정마다 `ruleset_version`을 박아둔다.
+판정은 보장되지 않는다. 그래서 판정마다 `rulesets_version`을 박아둔다.
 
 ---
 

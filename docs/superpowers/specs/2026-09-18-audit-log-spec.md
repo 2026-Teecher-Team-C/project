@@ -36,7 +36,7 @@
 | `BYPASS_DOMAIN` | `bypass_domains` | UUID |
 | `FILE_TYPE_POLICY` | `file_type_policies` | UUID |
 | `FILE_VERDICT` | `file_verdicts` | SHA-256 64자 |
-| `CACHE` | (`cache_invalidations`) | 무효화 대상 값 또는 NULL |
+| `CACHE` | (테이블 없음 — Redis 직접 무효화) | 무효화 대상 값 또는 NULL |
 
 ### 감사 대상이 아닌 테이블
 

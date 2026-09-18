@@ -26,7 +26,7 @@
 | 정책(바이패스·검사수준) | 없음 | `bypass_domains` + `file_type_policies` |
 | 오탐 복원 | 기록 불가 | `quarantine_files.status/restored_by/restored_at` |
 | `admin_users` 연결 | FK 0개(고립) | 복원·리스트·정책·룰셋·감사로그에 연결 |
-| 테이블 수 | 7 | 15 (서버 RDS만. 에이전트 측 DB 없음 — 5장) |
+| 테이블 수 | 7 | 14 (서버 RDS만. 에이전트 측 DB 없음 — 5장) |
 
 ---
 
@@ -57,7 +57,7 @@
 8. **`download_event.status`와 `verdicts.verdict` 이중 진실** — "차단됐나"를 두 곳에서 표현할 수 있어
    불일치가 발생한다. enum 정의도 없다.
 9. **판정 재현성·캐시 무효화 불가** — 어떤 룰이 매칭됐는지, 어떤 룰셋 버전으로 판정했는지가 없다.
-   `yara_matched` 불리언 하나뿐이라 Phase 4의 "캐시 무효화 채널"이 전량 무효화밖에 못 한다.
+   `yara_matched` 불리언 하나뿐이라 캐시 무효화가 전량 삭제밖에 못 한다.
 10. **에이전트 인증 수단 없음** — `agent_id`를 에이전트 자기 주장으로 받으면 이벤트 위조가 가능하다
     (아키텍처 리뷰 3.1의 인증 지적과 동일한 문제).
 
@@ -91,7 +91,6 @@ erDiagram
     admin_users     ||--o{ yara_rulesets       : "활성화"
     admin_users     ||--o{ bypass_domains      : "관리"
     admin_users     ||--o{ file_type_policies  : "수정"
-    admin_users     ||--o{ cache_invalidations : "발행"
 
     agents          ||--o{ download_events     : "발생시킴"
     agents          ||--o{ quarantine_files    : "출처"
@@ -130,8 +129,7 @@ erDiagram
 | 11 | `quarantine_files` | S3 격리 보관 + 복원 상태 | 2주차 |
 | 12 | `bypass_domains` | 바이패스 도메인 | 3주차 |
 | 13 | `file_type_policies` | 타입별 검사 수준, N MB 초과 정책 | 4주차 |
-| 14 | `cache_invalidations` | 캐시 무효화 채널 (서버 → Redis/에이전트) | 4주차 |
-| 15 | `audit_logs` | 관리자 행위 감사 | 3주차 |
+| 14 | `audit_logs` | 관리자 행위 감사 | 3주차 |
 
 > `spool_files`는 서버 스키마에서 **삭제**한다. 에이전트 인메모리 상태로만 관리하며, 이를 대체할
 > 로컬 DB를 두지 않는다 (5장 참고).
@@ -175,7 +173,8 @@ CREATE TABLE agents (
     status                VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE'
                                        CHECK (status IN ('ACTIVE','INACTIVE','REVOKED')),
     last_heartbeat_at     TIMESTAMPTZ,              -- 등록 직후 NULL
-    registered_at         TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    created_at            TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    deleted_at            TIMESTAMPTZ,          -- status의 DELETED와 역할 중복 — 재검토 대상
     updated_at            TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_agents_heartbeat ON agents (last_heartbeat_at DESC)
@@ -185,7 +184,7 @@ CREATE INDEX idx_agents_heartbeat ON agents (last_heartbeat_at DESC)
 -- 3-4. YARA 룰셋 / 룰
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE yara_rulesets (
-    version      INTEGER     PRIMARY KEY,
+    rulesets_version INTEGER PRIMARY KEY,
     rule_count   INTEGER     NOT NULL DEFAULT 0,
     is_active    BOOLEAN     NOT NULL DEFAULT FALSE,
     activated_at TIMESTAMPTZ,
@@ -199,13 +198,13 @@ CREATE UNIQUE INDEX uq_yara_rulesets_active ON yara_rulesets (is_active)
 
 CREATE TABLE yara_rules (
     rule_id    UUID         PRIMARY KEY,
-    ruleset_version INTEGER NOT NULL REFERENCES yara_rulesets(version) ON DELETE CASCADE,
+    rulesets_version INTEGER NOT NULL REFERENCES yara_rulesets(rulesets_version) ON DELETE CASCADE,
     rule_name  VARCHAR(128) NOT NULL,
     severity   VARCHAR(16)  NOT NULL DEFAULT 'MEDIUM'
                             CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL')),
     enabled    BOOLEAN      NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    UNIQUE (ruleset_version, rule_name)
+    UNIQUE (rulesets_version, rule_name)
 );
 
 -- ─────────────────────────────────────────────────────────
@@ -220,7 +219,7 @@ CREATE TABLE file_verdicts (
                                    CHECK (verdict IN ('CLEAN','MALICIOUS','SUSPICIOUS','UNKNOWN','ERROR')),
     verdict_source     VARCHAR(16) NOT NULL
                                    CHECK (verdict_source IN ('WHITELIST','BLACKLIST','ENGINE','MANUAL')),
-    ruleset_version    INTEGER     REFERENCES yara_rulesets(version),  -- 리스트 판정이면 NULL
+    rulesets_version   INTEGER     REFERENCES yara_rulesets(rulesets_version),  -- 리스트 판정이면 NULL
     is_stale           BOOLEAN     NOT NULL DEFAULT FALSE,  -- 룰셋 갱신/오탐 복원으로 무효화됨
     analysis_count     INTEGER     NOT NULL DEFAULT 0,
     hit_count          BIGINT      NOT NULL DEFAULT 0,      -- 캐시 히트율 집계용
@@ -276,7 +275,7 @@ CREATE TABLE analyses (
     analysis_id         UUID        PRIMARY KEY,
     sha256              CHAR(64)    NOT NULL REFERENCES file_verdicts(sha256),
     event_id            UUID        REFERENCES download_events(event_id),  -- 룰셋 갱신 재검사는 NULL
-    ruleset_version     INTEGER     REFERENCES yara_rulesets(version),
+    rulesets_version    INTEGER     NOT NULL REFERENCES yara_rulesets(rulesets_version),
     engine_version      VARCHAR(32) NOT NULL,
     status              VARCHAR(16) NOT NULL
                                     CHECK (status IN ('SUCCESS','TIMEOUT','CRASH','OOM','UNSUPPORTED')),
@@ -383,25 +382,12 @@ CREATE TABLE file_type_policies (
                                        CHECK (oversize_action IN ('PASS','BLOCK','WARN')),
     is_active              BOOLEAN     NOT NULL DEFAULT TRUE,
     updated_by             UUID        REFERENCES admin_users(admin_id),
-    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- ─────────────────────────────────────────────────────────
--- 15. 캐시 무효화 채널 (서버 → Redis / 에이전트)
--- ─────────────────────────────────────────────────────────
-CREATE TABLE cache_invalidations (
-    invalidation_id UUID         PRIMARY KEY,
-    target_type     VARCHAR(16)  NOT NULL
-                                 CHECK (target_type IN ('HASH','RULESET','ALL')),
-    target_value    VARCHAR(128),               -- target_type='ALL'이면 NULL
-    reason          TEXT         NOT NULL,
-    created_by      UUID         REFERENCES admin_users(admin_id),
-    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now()
-);
-CREATE INDEX idx_invalidations_created ON cache_invalidations (created_at DESC);
-
--- ─────────────────────────────────────────────────────────
--- 16. 감사 로그
+-- 14. 감사 로그
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE audit_logs (
     log_id      BIGSERIAL    PRIMARY KEY,
@@ -453,7 +439,7 @@ SELECT hash_value FROM hash_blacklist WHERE hash_type = 'SHA256' AND is_active;
   → quarantine_files.status = 'RESTORED', restored_by/restored_at 기록
   → hash_whitelist INSERT (origin_quarantine_id로 출처 연결)
   → file_verdicts.is_stale = TRUE          (캐시된 악성 판정 무효화)
-  → cache_invalidations INSERT (HASH)      (Redis 해시 캐시 삭제 + 에이전트 통지)
+  → Redis 해시 캐시 직접 삭제              (에이전트는 판정을 캐시하지 않으므로 통지 불필요)
   → audit_logs INSERT
 ```
 
@@ -464,8 +450,8 @@ SELECT hash_value FROM hash_blacklist WHERE hash_type = 'SHA256' AND is_active;
 
 ```
 새 룰셋 활성화 (yara_rulesets.is_active 전환)
-  → UPDATE file_verdicts SET is_stale = TRUE WHERE ruleset_version < <새 버전>   (조인 없음)
-  → cache_invalidations INSERT (RULESET)
+  → UPDATE file_verdicts SET is_stale = TRUE WHERE rulesets_version < <새 버전>   (조인 없음)
+  → Redis 블룸 필터·해시 캐시 직접 삭제
   → 이후 같은 해시가 다시 들어오면 캐시 미스로 재검사 → analyses 행이 하나 더 쌓임
 ```
 
@@ -546,14 +532,14 @@ DB가 필요해 보이는 유일한 후보가 "스풀 파일 추적"인데, **�
 ## 7. MVP(4일)에서 실제로 필요한 최소 집합
 
 [`2026-09-13-mvp-scope.md`](2026-09-13-mvp-scope.md)는 관리 콘솔·오탐 복원·정식 RDS 스키마를 모두
-제외했다. 위 15개 테이블 중 MVP에 실제로 필요한 것은 4개뿐이다.
+제외했다. 위 14개 테이블 중 MVP에 실제로 필요한 것은 4개뿐이다.
 
 ```
 agents  ·  download_events  ·  file_verdicts  ·  hash_blacklist
 ```
 
 - `analyses` / `analysis_matches`는 MVP에선 `file_verdicts` 한 행으로 뭉개도 된다
-- `admin_users` / 정책 / 감사 로그 / 캐시 무효화는 콘솔이 생기는 3~4주차 항목
+- `admin_users` / 정책 / 감사 로그는 콘솔이 생기는 3~4주차 항목
 - **단, `file_verdicts`를 해시 PK로 만드는 것만은 MVP부터 지켜야 한다.** 여기를 인스턴스 기준으로
   만들면 나중에 캐시를 붙일 때 스키마와 코드를 전부 다시 써야 한다
 
