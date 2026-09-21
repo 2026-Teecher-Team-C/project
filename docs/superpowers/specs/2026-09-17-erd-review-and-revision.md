@@ -26,7 +26,8 @@
 | 정책(바이패스·검사수준) | 없음 | `bypass_domains` + `file_type_policies` |
 | 오탐 복원 | 기록 불가 | `quarantine_files.status/restored_by/restored_at` |
 | `admin_users` 연결 | FK 0개(고립) | 복원·리스트·정책·룰셋·감사로그에 연결 |
-| 테이블 수 | 7 | 14 (서버 RDS만. 에이전트 측 DB 없음 — 5장) |
+| 장비 식별 단위 | `agents` 하나가 장비와 설치를 겸함 | **`devices`(물리 장비) / `agents`(설치 인스턴스) 분리** (2.3) |
+| 테이블 수 | 7 | 15 (서버 RDS만. 에이전트 측 DB 없음 — 5장) |
 
 ---
 
@@ -92,6 +93,8 @@ erDiagram
     admin_users     ||--o{ bypass_domains      : "관리"
     admin_users     ||--o{ file_type_policies  : "수정"
 
+    devices         ||--o{ agents              : "설치"
+
     agents          ||--o{ download_events     : "발생시킴"
     agents          ||--o{ quarantine_files    : "출처"
 
@@ -117,22 +120,80 @@ erDiagram
 | # | 테이블 | 역할 | 도입 시점 |
 |---|---|---|---|
 | 1 | `admin_users` | 콘솔 계정 | 3주차 |
-| 2 | `agents` | 에이전트 등록·하트비트·토큰 | 2주차 |
-| 3 | `yara_rulesets` | 룰셋 버전 (활성 1개) | 2주차 |
-| 4 | `yara_rules` | 개별 YARA 룰 | 2주차 |
-| 5 | **`file_verdicts`** | **해시 단위 판정 캐시 — 스키마의 중심** | 1주차 |
-| 6 | `download_events` | 다운로드 1건의 파이프라인 이력·성능 지표 | 1주차 |
-| 7 | `analyses` | 탐지 엔진 실행 1회의 기록 (성공/타임아웃/크래시 포함) | 2주차 |
-| 8 | `analysis_matches` | 어떤 룰이 매칭됐는가 | 2주차 |
-| 9 | `hash_blacklist` | 알려진 악성 해시 | 1주차 |
-| 10 | `hash_whitelist` | 오탐 복원·예외 (블룸 필터 앞단) | 3주차 |
-| 11 | `quarantine_files` | S3 격리 보관 + 복원 상태 | 2주차 |
-| 12 | `bypass_domains` | 바이패스 도메인 | 3주차 |
-| 13 | `file_type_policies` | 타입별 검사 수준, N MB 초과 정책 | 4주차 |
-| 14 | `audit_logs` | 관리자 행위 감사 | 3주차 |
+| 2 | `devices` | 물리 장비 (재설치로 바뀌지 않는 식별 단위) | 2주차 |
+| 3 | `agents` | 설치 인스턴스 — 하트비트·토큰 | 2주차 |
+| 4 | `yara_rulesets` | 룰셋 버전 (활성 1개) | 2주차 |
+| 5 | `yara_rules` | 개별 YARA 룰 | 2주차 |
+| 6 | **`file_verdicts`** | **해시 단위 판정 캐시 — 스키마의 중심** | 1주차 |
+| 7 | `download_events` | 다운로드 1건의 파이프라인 이력·성능 지표 | 1주차 |
+| 8 | `analyses` | 탐지 엔진 실행 1회의 기록 (성공/타임아웃/크래시 포함) | 2주차 |
+| 9 | `analysis_matches` | 어떤 룰이 매칭됐는가 | 2주차 |
+| 10 | `hash_blacklist` | 알려진 악성 해시 | 1주차 |
+| 11 | `hash_whitelist` | 오탐 복원·예외 (블룸 필터 앞단) | 3주차 |
+| 12 | `quarantine_files` | S3 격리 보관 + 복원 상태 | 2주차 |
+| 13 | `bypass_domains` | 바이패스 도메인 | 3주차 |
+| 14 | `file_type_policies` | 타입별 검사 수준, N MB 초과 정책 | 4주차 |
+| 15 | `audit_logs` | 관리자 행위 감사 | 3주차 |
 
 > `spool_files`는 서버 스키마에서 **삭제**한다. 에이전트 인메모리 상태로만 관리하며, 이를 대체할
 > 로컬 DB를 두지 않는다 (5장 참고).
+
+### 2.3 `devices` / `agents` 분리 — 무엇을 식별하는가 (2026-09-20 결정)
+
+초안의 `agents`는 **물리 장비**와 **에이전트 설치 인스턴스** 두 개념을 한 테이블에 담고 있었다.
+이 상태에서는 OS를 재설치할 때마다 새 `agent_id`가 발급되고, 같은 PC가 서로 다른 에이전트 여러
+개로 보여 장비 단위 이력이 끊긴다. `status`와 `deleted_at`의 역할 중복도 여기서 나온 것이다.
+
+| 테이블 | 담는 것 | 재설치하면 |
+|---|---|---|
+| `devices` | 물리 장비 — 하드웨어 지문, 호스트명, OS, 폐기 여부 | 그대로 유지 |
+| `agents` | 설치 인스턴스 — 에이전트 버전, 등록 토큰, 하트비트 | 새 행 생성 |
+
+`download_events` / `quarantine_files`의 FK는 **`agents`를 그대로 참조한다.** "어느 설치
+인스턴스가 이 다운로드를 처리했나"가 여전히 맞는 질문이고, 장비 단위 이력은 `agents → devices`
+조인으로 나온다.
+
+#### 식별 원칙
+
+> 본 시스템은 **장비(에이전트)를 식별하며 사용자 신원은 보관하지 않는다.** 에이전트 → 사용자
+> 매핑이 필요한 경우 조직의 자산 관리 시스템에서 조회한다.
+
+대응 조치의 단위가 원래 PC다 — 악성 파일을 발견하면 그 PC를 격리하고 점검한다. 사용자 신원을
+중복 보관하면 얻는 건 없고 "직원이 무엇을 다운로드했는지 기록한 DB"라는 부담만 남는다.
+6장의 `download_events.url` 보존 논의와 같은 맥락이다.
+
+#### `hardware_uuid`는 힌트이지 권위가 아니다
+
+값은 플랫폼별 하드웨어 식별자를 쓴다 — Windows SMBIOS UUID(`Win32_ComputerSystemProduct.UUID`),
+macOS `IOPlatformUUID`, Linux `/sys/class/dmi/id/product_uuid`. Windows `MachineGuid`나 Linux
+`/etc/machine-id`는 **OS 재설치 시 바뀌므로** 쓰지 않는다.
+
+다만 이 값은 에이전트가 보고하는 값이라 서버가 검증할 수 없다(프록시 너머라 L2 정보도 없다).
+따라서 **신원의 권위는 등록 토큰(`agents.enrollment_token_hash`)에 두고**, `hardware_uuid`는
+"이 등록은 기존 장비 A의 재설치로 보입니다"를 관리자에게 **제안**하는 용도로만 쓴다.
+자동 병합 로직은 만들지 않는다 — 위조해도 관리자 화면에 이상 신호로 남을 뿐, 조용히 이력을
+갈아끼우지 못한다.
+
+`UNIQUE` 제약도 걸지 않는다. 걸면 남의 UUID를 보고하는 것만으로 정상 장비의 등록을 막을 수 있다.
+
+#### MAC 주소를 쓰지 않는 이유
+
+| 문제 | 내용 |
+|---|---|
+| 다중 어댑터 | 유선·Wi-Fi에 더해 VMware·Docker·WSL·VPN 가상 어댑터가 각각 MAC을 가진다 |
+| 환경 의존 | 도킹 스테이션/Wi-Fi 전환만으로 같은 PC가 다른 값을 보고한다 |
+| 랜덤화 | Windows 11·macOS·iOS·Android가 Wi-Fi 연결마다 임의 MAC을 쓰는 게 기본값이다 |
+| 위조 용이 | 한 줄로 바꿀 수 있다 — 탬퍼 탐지를 하려는 목적과 정면으로 충돌한다 |
+
+목적 없이 개인식별성 있는 값을 보관하지 않는다는 원칙에도 어긋나므로 **컬럼 자체를 두지 않는다.**
+네트워크 조사 요구가 실제로 생기면 그때 목적과 함께 추가한다.
+
+#### 연동되는 결정
+
+- **공유 PC / VDI는 비대응 범위**다. 한 대를 여러 명이 쓰면 장비 식별로 사람을 짚을 수 없다.
+  제품 설계 8장에 QUIC·피닝 앱과 같은 줄로 적어 1인 1PC 전제를 명시한다
+- 그룹 단위 정책을 도입하면 `group_id`는 **`devices`에 붙는다.** 정책은 장비에 걸리지, 무엇을
+  설치했는지에 걸리지 않는다
 
 ---
 
@@ -161,27 +222,45 @@ CREATE TABLE admin_users (
 );
 
 -- ─────────────────────────────────────────────────────────
--- 2. 에이전트 (PC 현황 / 하트비트 / 인증)
+-- 2. 물리 장비 (OS 재설치로도 바뀌지 않는 식별 단위 — 2.3)
+-- ─────────────────────────────────────────────────────────
+CREATE TABLE devices (
+    device_id     UUID         PRIMARY KEY,
+    hardware_uuid VARCHAR(64),                  -- SMBIOS UUID / IOPlatformUUID. 에이전트 보고값
+    hostname      VARCHAR(255) NOT NULL,        -- 표시용. 변경·중복 가능 → 키로 쓰지 않는다
+    os_platform   VARCHAR(16)  NOT NULL
+                               CHECK (os_platform IN ('WINDOWS','MACOS','LINUX')),
+    status        VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE'
+                               CHECK (status IN ('ACTIVE','RETIRED')),
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+-- UNIQUE를 걸지 않는다 (2.3 참고) — 위조 가능한 보고값이므로 중복을 허용하고
+-- 재설치 연결은 관리자가 수동으로 판단한다
+CREATE INDEX idx_devices_hardware_uuid ON devices (hardware_uuid)
+    WHERE hardware_uuid IS NOT NULL;
+
+-- ─────────────────────────────────────────────────────────
+-- 3. 에이전트 = 설치 인스턴스 (하트비트 / 인증)
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE agents (
     agent_id              UUID         PRIMARY KEY,
-    hostname              VARCHAR(255) NOT NULL,
-    os_platform           VARCHAR(16)  NOT NULL
-                                       CHECK (os_platform IN ('WINDOWS','MACOS','LINUX')),
+    device_id             UUID         NOT NULL REFERENCES devices(device_id),
     agent_version         VARCHAR(32)  NOT NULL,
     enrollment_token_hash VARCHAR(255) NOT NULL,    -- 평문 토큰 저장 금지
     status                VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE'
                                        CHECK (status IN ('ACTIVE','INACTIVE','REVOKED')),
     last_heartbeat_at     TIMESTAMPTZ,              -- 등록 직후 NULL
     created_at            TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    deleted_at            TIMESTAMPTZ,          -- status의 DELETED와 역할 중복 — 재검토 대상
     updated_at            TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+-- deleted_at 삭제: 장비 폐기는 devices.status = RETIRED,
+-- 설치 인스턴스 무효화는 agents.status = REVOKED로 역할이 갈린다 (초안의 중복 해소)
 CREATE INDEX idx_agents_heartbeat ON agents (last_heartbeat_at DESC)
     WHERE status = 'ACTIVE';
 
 -- ─────────────────────────────────────────────────────────
--- 3-4. YARA 룰셋 / 룰
+-- 4-5. YARA 룰셋 / 룰
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE yara_rulesets (
     rulesets_version INTEGER PRIMARY KEY,
@@ -208,7 +287,7 @@ CREATE TABLE yara_rules (
 );
 
 -- ─────────────────────────────────────────────────────────
--- 5. 해시 단위 판정 캐시 ★ 이 스키마의 중심
+-- 6. 해시 단위 판정 캐시 ★ 이 스키마의 중심
 --    "해시 조회 → 캐시 히트"의 조회 대상. 블룸 필터의 원천 데이터이기도 하다.
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE file_verdicts (
@@ -231,7 +310,7 @@ CREATE INDEX idx_file_verdicts_malicious ON file_verdicts (last_verdict_at DESC)
 -- ↑ 블룸 필터 재구축 시 이 인덱스로 악성 해시만 스캔
 
 -- ─────────────────────────────────────────────────────────
--- 6. 다운로드 이벤트 (인스턴스 이력 + 성능 지표)
+-- 7. 다운로드 이벤트 (인스턴스 이력 + 성능 지표)
 --    ※ 다운로드로 판별된 응답만 INSERT. 일반 트래픽은 행을 만들지 않는다.
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE download_events (
@@ -268,7 +347,7 @@ CREATE INDEX idx_events_blocked  ON download_events (created_at DESC)
     WHERE decision = 'BLOCKED';
 
 -- ─────────────────────────────────────────────────────────
--- 7-8. 검사 실행 기록 (탐지 엔진 1회 실행) + 룰 매칭
+-- 8-9. 검사 실행 기록 (탐지 엔진 1회 실행) + 룰 매칭
 --    크래시/타임아웃도 행으로 남긴다 — "크래시 시 해당 파일만 실패 처리"의 근거
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE analyses (
@@ -301,7 +380,7 @@ CREATE TABLE analysis_matches (
 );
 
 -- ─────────────────────────────────────────────────────────
--- 9-10. 해시 리스트 (블랙 / 화이트)
+-- 10-11. 해시 리스트 (블랙 / 화이트)
 --      화이트리스트는 블룸 필터보다 먼저 조회되는 별도 레이어다
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE hash_blacklist (
@@ -333,7 +412,7 @@ CREATE TABLE hash_whitelist (
 );
 
 -- ─────────────────────────────────────────────────────────
--- 11. 격리 파일 (S3 보관 — 배포 아키텍처 문서 2장 확정 사항)
+-- 12. 격리 파일 (S3 보관 — 배포 아키텍처 문서 2장 확정 사항)
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE quarantine_files (
     quarantine_id     UUID          PRIMARY KEY,
@@ -361,7 +440,7 @@ ALTER TABLE hash_whitelist
     FOREIGN KEY (origin_quarantine_id) REFERENCES quarantine_files(quarantine_id);
 
 -- ─────────────────────────────────────────────────────────
--- 12-13. 정책
+-- 13-14. 정책
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE bypass_domains (
     bypass_id      UUID         PRIMARY KEY,
@@ -387,7 +466,7 @@ CREATE TABLE file_type_policies (
 );
 
 -- ─────────────────────────────────────────────────────────
--- 14. 감사 로그
+-- 15. 감사 로그
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE audit_logs (
     log_id      BIGSERIAL    PRIMARY KEY,
@@ -532,13 +611,15 @@ DB가 필요해 보이는 유일한 후보가 "스풀 파일 추적"인데, **�
 ## 7. MVP(4일)에서 실제로 필요한 최소 집합
 
 [`2026-09-13-mvp-scope.md`](2026-09-13-mvp-scope.md)는 관리 콘솔·오탐 복원·정식 RDS 스키마를 모두
-제외했다. 위 14개 테이블 중 MVP에 실제로 필요한 것은 4개뿐이다.
+제외했다. 위 15개 테이블 중 MVP에 실제로 필요한 것은 5개뿐이다.
 
 ```
-agents  ·  download_events  ·  file_verdicts  ·  hash_blacklist
+devices  ·  agents  ·  download_events  ·  file_verdicts  ·  hash_blacklist
 ```
 
 - `analyses` / `analysis_matches`는 MVP에선 `file_verdicts` 한 행으로 뭉개도 된다
+- `devices`는 MVP에서 시연용 1행(에이전트 1대)만 있으면 된다. `agents.device_id`가 NOT NULL이라
+  테이블 자체는 있어야 하지만, 재설치 연결 화면 같은 기능은 콘솔이 생긴 뒤 항목이다
 - `admin_users` / 정책 / 감사 로그는 콘솔이 생기는 3~4주차 항목
 - **단, `file_verdicts`를 해시 PK로 만드는 것만은 MVP부터 지켜야 한다.** 여기를 인스턴스 기준으로
   만들면 나중에 캐시를 붙일 때 스키마와 코드를 전부 다시 써야 한다

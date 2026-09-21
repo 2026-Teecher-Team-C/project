@@ -36,24 +36,47 @@ CREATE TABLE admin_users (
     CONSTRAINT ck_admin_users_role CHECK (role IN ('ADMIN','ANALYST','VIEWER'))
 );
 
--- 2. 에이전트 (PC 현황 / 하트비트 / 인증)
+-- 2. 물리 장비 (PC 1대 = 1행. OS 재설치로도 바뀌지 않는 단위)
+--    설치 인스턴스(agents)와 분리한다 — 재설치하면 agents에 새 행이 생기지만
+--    devices는 그대로이므로 장비 단위 이력이 끊기지 않는다.
+CREATE TABLE devices (
+    device_id     UUID         NOT NULL,
+    hardware_uuid VARCHAR(64),                  -- SMBIOS UUID / IOPlatformUUID. 에이전트 보고값
+    hostname      VARCHAR(255) NOT NULL,        -- 표시용. 변경·중복 가능하므로 키로 쓰지 않는다
+    os_platform   VARCHAR(16)  NOT NULL,
+    status        VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    CONSTRAINT pk_devices PRIMARY KEY (device_id),
+    CONSTRAINT ck_devices_os CHECK (os_platform IN ('WINDOWS','MACOS','LINUX')),
+    CONSTRAINT ck_devices_status CHECK (status IN ('ACTIVE','RETIRED'))
+);
+-- hardware_uuid에 UNIQUE를 걸지 않는 이유: 에이전트가 보고하는 값이라 위조 가능하다.
+-- UNIQUE면 남의 UUID를 보고하는 것만으로 정상 장비의 등록을 막을 수 있다(DoS).
+-- 중복은 허용하고, 재설치 시 기존 장비로 잇는 판단은 관리자가 콘솔에서 수동으로 한다.
+-- MAC 주소는 저장하지 않는다 — 랜덤화·다중 어댑터·위조로 식별자 역할을 못 하며,
+-- 목적 없이 개인식별성 있는 값을 보관하지 않는다는 원칙에도 어긋난다.
+
+-- 3. 에이전트 = 설치 인스턴스 (하트비트 / 인증)
+--    재설치하면 같은 device_id 아래 새 행이 생긴다.
 CREATE TABLE agents (
     agent_id              UUID         NOT NULL,
-    hostname              VARCHAR(255) NOT NULL,
-    os_platform           VARCHAR(16)  NOT NULL,
+    device_id             UUID         NOT NULL,
     agent_version         VARCHAR(32)  NOT NULL,
-    enrollment_token_hash VARCHAR(255) NOT NULL,
+    enrollment_token_hash VARCHAR(255) NOT NULL, -- 평문 토큰 저장 금지
     status                VARCHAR(16)  NOT NULL DEFAULT 'ACTIVE',
-    last_heartbeat_at     TIMESTAMPTZ,
+    last_heartbeat_at     TIMESTAMPTZ,           -- 등록 직후 NULL
     created_at            TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at            TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    deleted_at            TIMESTAMPTZ,          -- 소프트 삭제. status의 DELETED와 역할이 겹침 — 재검토 대상
     CONSTRAINT pk_agents PRIMARY KEY (agent_id),
-    CONSTRAINT ck_agents_os CHECK (os_platform IN ('WINDOWS','MACOS','LINUX')),
+    CONSTRAINT fk_agents_device FOREIGN KEY (device_id)
+        REFERENCES devices (device_id),
     CONSTRAINT ck_agents_status CHECK (status IN ('ACTIVE','INACTIVE','REVOKED'))
 );
+-- deleted_at을 두지 않는다: 장비 폐기는 devices.status = RETIRED,
+-- 설치 인스턴스 무효화는 agents.status = REVOKED로 역할이 갈린다.
 
--- 3. YARA 룰셋 버전 (활성 룰셋은 항상 1개 — [3] 섹션의 부분 유니크 인덱스로 강제)
+-- 4. YARA 룰셋 버전 (활성 룰셋은 항상 1개 — [3] 섹션의 부분 유니크 인덱스로 강제)
 CREATE TABLE yara_rulesets (
     rulesets_version INTEGER NOT NULL,
     rule_count   INTEGER     NOT NULL DEFAULT 0,
@@ -67,7 +90,7 @@ CREATE TABLE yara_rulesets (
         REFERENCES admin_users (admin_id)
 );
 
--- 4. 개별 YARA 룰
+-- 5. 개별 YARA 룰
 CREATE TABLE yara_rules (
     rule_id         UUID         NOT NULL,
     rulesets_version INTEGER     NOT NULL,
@@ -82,7 +105,7 @@ CREATE TABLE yara_rules (
     CONSTRAINT ck_yara_rules_severity CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL'))
 );
 
--- 5. ★ 해시 단위 판정 캐시 — 이 스키마의 중심
+-- 6. ★ 해시 단위 판정 캐시 — 이 스키마의 중심
 --    "해시 조회 -> 캐시 히트"의 조회 대상이자 블룸 필터의 원천 데이터.
 --    판정이 다운로드 인스턴스가 아니라 파일 해시에 귀속되는 것이 핵심이다.
 CREATE TABLE file_verdicts (
@@ -106,7 +129,7 @@ CREATE TABLE file_verdicts (
         CHECK (verdict_source IN ('WHITELIST','BLACKLIST','ENGINE','MANUAL'))
 );
 
--- 6. 다운로드 이벤트 (인스턴스 이력 + 성능 지표)
+-- 7. 다운로드 이벤트 (인스턴스 이력 + 성능 지표)
 --    ※ 다운로드로 판별된 응답만 INSERT. 일반 트래픽은 행을 만들지 않는다.
 CREATE TABLE download_events (
     event_id            UUID         NOT NULL,
@@ -142,7 +165,7 @@ CREATE TABLE download_events (
         CHECK (pipeline_status <> 'COMPLETED' OR decision IS NOT NULL)
 );
 
--- 7. 검사 실행 기록 (탐지 엔진 1회 실행)
+-- 8. 검사 실행 기록 (탐지 엔진 1회 실행)
 --    크래시/타임아웃도 행으로 남긴다 — "크래시 시 해당 파일만 실패 처리"의 근거.
 --    event_id NULL = 다운로드 없이 룰셋 갱신으로 재검사한 경우.
 CREATE TABLE analyses (
@@ -172,7 +195,7 @@ CREATE TABLE analyses (
         CHECK (verdict IN ('CLEAN','MALICIOUS','SUSPICIOUS','UNKNOWN','ERROR'))
 );
 
--- 8. 룰 매칭 결과 (어떤 룰이 매칭됐는가 — 차단 사유 표시용)
+-- 9. 룰 매칭 결과 (어떤 룰이 매칭됐는가 — 차단 사유 표시용)
 CREATE TABLE analysis_matches (
     match_id        UUID         NOT NULL,
     analysis_id     UUID         NOT NULL,
@@ -188,7 +211,7 @@ CREATE TABLE analysis_matches (
         REFERENCES yara_rules (rule_id)
 );
 
--- 9. 해시 블랙리스트 (삭제 대신 is_active=FALSE로 비활성화 — 이력 보존)
+-- 10. 해시 블랙리스트 (삭제 대신 is_active=FALSE로 비활성화 — 이력 보존)
 CREATE TABLE hash_blacklist (
     hash_type      VARCHAR(16)  NOT NULL DEFAULT 'SHA256',
     hash_value     VARCHAR(128) NOT NULL,
@@ -207,7 +230,7 @@ CREATE TABLE hash_blacklist (
         CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL'))
 );
 
--- 10. 해시 화이트리스트 (오탐 복원 / 예외)
+-- 11. 해시 화이트리스트 (오탐 복원 / 예외)
 --     블룸 필터는 삭제가 불가능하므로, 조회 순서상 블룸 필터보다 먼저 확인되는
 --     별도 레이어로 존재해야 한다 (설계서 4.1).
 CREATE TABLE hash_whitelist (
@@ -226,7 +249,7 @@ CREATE TABLE hash_whitelist (
     -- origin_quarantine_id -> quarantine_files FK는 [2] 섹션에서 추가 (순환 참조 회피)
 );
 
--- 11. 격리 파일 (S3 보관 — 배포 아키텍처 문서 2장)
+-- 12. 격리 파일 (S3 보관 — 배포 아키텍처 문서 2장)
 CREATE TABLE quarantine_files (
     quarantine_id     UUID          NOT NULL,
     event_id          UUID          NOT NULL,
@@ -260,7 +283,7 @@ CREATE TABLE quarantine_files (
         CHECK (status <> 'RESTORED' OR (restored_at IS NOT NULL AND restored_by IS NOT NULL))
 );
 
--- 12. 바이패스 도메인 (인증서 피닝 앱 등)
+-- 13. 바이패스 도메인 (인증서 피닝 앱 등)
 CREATE TABLE bypass_domains (
     bypass_id      UUID         NOT NULL,
     domain_pattern VARCHAR(255) NOT NULL,
@@ -274,7 +297,7 @@ CREATE TABLE bypass_domains (
         REFERENCES admin_users (admin_id)
 );
 
--- 13. 파일 타입별 검사 정책 (검사 수준 + "N MB 초과 파일 정책")
+-- 14. 파일 타입별 검사 정책 (검사 수준 + "N MB 초과 파일 정책")
 CREATE TABLE file_type_policies (
     file_type_policy_id    UUID        NOT NULL,
     file_type              VARCHAR(32) NOT NULL,
@@ -295,7 +318,7 @@ CREATE TABLE file_type_policies (
         CHECK (oversize_action IN ('PASS','BLOCK','WARN'))
 );
 
--- 14. 감사 로그 (관리자 행위 추적)
+-- 15. 감사 로그 (관리자 행위 추적)
 CREATE TABLE audit_logs (
     log_id      BIGSERIAL   NOT NULL,
     actor_id    UUID,
@@ -328,6 +351,10 @@ ALTER TABLE hash_whitelist
 CREATE UNIQUE INDEX uq_yara_rulesets_active ON yara_rulesets (is_active)
     WHERE is_active;
 
+-- 재설치 시 기존 장비 후보 검색 (자동 매칭이 아니라 관리자에게 제안하는 용도)
+CREATE INDEX idx_devices_hardware_uuid ON devices (hardware_uuid)
+    WHERE hardware_uuid IS NOT NULL;
+
 -- 온라인 PC 현황 조회
 CREATE INDEX idx_agents_heartbeat ON agents (last_heartbeat_at DESC)
     WHERE status = 'ACTIVE';
@@ -355,7 +382,8 @@ CREATE INDEX idx_audit_actor ON audit_logs (actor_id, created_at DESC);
 -- ============================================================================
 
 COMMENT ON TABLE admin_users         IS '관리 콘솔 계정';
-COMMENT ON TABLE agents              IS '에이전트 등록/하트비트/인증';
+COMMENT ON TABLE devices             IS '물리 장비 (OS 재설치로 바뀌지 않는 식별 단위)';
+COMMENT ON TABLE agents              IS '에이전트 설치 인스턴스 (하트비트/인증)';
 COMMENT ON TABLE yara_rulesets       IS 'YARA 룰셋 버전 (활성 1개)';
 COMMENT ON TABLE yara_rules          IS '개별 YARA 룰';
 COMMENT ON TABLE file_verdicts       IS '해시 단위 판정 캐시 (블룸 필터 원천)';
