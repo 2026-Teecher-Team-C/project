@@ -283,16 +283,20 @@ CREATE TABLE quarantine_files (
         CHECK (status <> 'RESTORED' OR (restored_at IS NOT NULL AND restored_by IS NOT NULL))
 );
 
--- 13. 바이패스 도메인 (인증서 피닝 앱 등)
+-- 13. 바이패스 도메인 (인증서 피닝 / 보안 기능 보호)
 CREATE TABLE bypass_domains (
     bypass_id      UUID         NOT NULL,
     domain_pattern VARCHAR(255) NOT NULL,
+    category       VARCHAR(24)  NOT NULL,
     reason         TEXT         NOT NULL,
     is_active      BOOLEAN      NOT NULL DEFAULT TRUE,
     created_by     UUID,
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
     CONSTRAINT pk_bypass_domains PRIMARY KEY (bypass_id),
     CONSTRAINT uq_bypass_domains_pattern UNIQUE (domain_pattern),
+    CONSTRAINT ck_bypass_domains_category CHECK (category IN ('PINNED','SECURITY_UPDATE')),
+    -- 와일드카드 금지: *.google.com은 drive.google.com까지 면제해 검사 구멍을 만든다
+    CONSTRAINT ck_bypass_domains_exact_host CHECK (domain_pattern NOT LIKE '%*%'),
     CONSTRAINT fk_bypass_domains_created_by FOREIGN KEY (created_by)
         REFERENCES admin_users (admin_id)
 );
@@ -393,6 +397,6 @@ COMMENT ON TABLE analysis_matches    IS '매칭된 YARA 룰 (차단 사유)';
 COMMENT ON TABLE hash_blacklist      IS '알려진 악성 해시';
 COMMENT ON TABLE hash_whitelist      IS '오탐 복원/예외 해시 (블룸 필터 앞단 레이어)';
 COMMENT ON TABLE quarantine_files    IS 'S3 격리 보관 및 복원 상태';
-COMMENT ON TABLE bypass_domains      IS '검사 바이패스 도메인';
+COMMENT ON TABLE bypass_domains      IS '검사 바이패스 도메인 (피닝 / 보안 기능 보호)';
 COMMENT ON TABLE file_type_policies  IS '파일 타입별 검사 수준 및 크기 초과 정책';
 COMMENT ON TABLE audit_logs          IS '관리자 행위 감사 로그';

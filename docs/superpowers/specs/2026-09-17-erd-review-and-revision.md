@@ -139,7 +139,7 @@ erDiagram
 | 10 | `hash_blacklist` | 알려진 악성 해시 | 1주차 |
 | 11 | `hash_whitelist` | 오탐 복원·예외 (블룸 필터 앞단) | 3주차 |
 | 12 | `quarantine_files` | S3 격리 보관 + 복원 상태 | 2주차 |
-| 13 | `bypass_domains` | 바이패스 도메인 | 3주차 |
+| 13 | `bypass_domains` | 바이패스 도메인 (피닝 / 보안 기능 보호 — 2.4) | 3주차 |
 | 14 | `file_type_policies` | 타입별 검사 수준, N MB 초과 정책 | 4주차 |
 | 15 | `audit_logs` | 관리자 행위 감사 | 3주차 |
 
@@ -202,6 +202,41 @@ macOS `IOPlatformUUID`, Linux `/sys/class/dmi/id/product_uuid`. Windows `Machine
   제품 설계 8장에 QUIC·피닝 앱과 같은 줄로 적어 1인 1PC 전제를 명시한다
 - 그룹 단위 정책을 도입하면 `group_id`는 **`devices`에 붙는다.** 정책은 장비에 걸리지, 무엇을
   설치했는지에 걸리지 않는다
+
+### 2.4 `bypass_domains` — 사유 구분과 fail-close 예외 (2026-09-21 결정)
+
+초안은 바이패스 사유로 **인증서 피닝**만 상정했다. PoC 1 재측정에서 성격이 다른 두 번째 사유가
+나왔다.
+
+| `category` | 무엇인가 | 왜 바이패스하나 |
+|---|---|---|
+| `PINNED` | 인증서 피닝 앱 | TLS 종료가 기술적으로 불가능 — 설계상 의도한 바이패스 |
+| `SECURITY_UPDATE` | 브라우저 보안 갱신 경로 | fail-close가 브라우저 방어 기능을 끄는 것을 막기 위한 **의도적 예외** |
+
+근거: 4분간 관측된 다운로드 20건 중 **13건이 Chrome 자동 업데이트**였다. fail-close 상태에서는
+Safe Browsing 위협 DB 갱신과 컴포넌트 업데이트가 조용히 막힌다 (제품 설계 6장).
+
+`reason` 자유 텍스트만으로 부족한 이유는 둘을 운영상 다르게 다뤄야 하기 때문이다. `PINNED`는
+해당 앱이 피닝을 풀면 제거 대상이고, `SECURITY_UPDATE`는 정책적 판단이라 주기적 재검토 대상이다.
+"지금 보안 목적 예외가 몇 개 걸려 있나"는 감사 질문도 자유 텍스트로는 조회되지 않는다.
+
+#### 바이패스 목록은 fail-close의 예외 통로다
+
+여기 오른 호스트는 **검사 서버가 죽어도 통과한다.** 이 테이블은 바이패스 목록인 동시에 fail-close
+정책의 구멍 목록이다. 두 가지가 따라온다.
+
+- 목록은 최소로 유지한다. 항목 추가·수정은 이미 `audit_logs`의 감사 대상이다
+- **와일드카드 금지를 DB 제약으로 강제한다.** `*.google.com`을 넣으면 `drive.google.com`까지
+  면제되는데, Google Drive는 실제 악성코드 유포 경로다. 컬럼명 `domain_pattern`이 패턴 입력을
+  유도하므로 `CHECK (domain_pattern NOT LIKE '%*%')`로 막았다 — 컬럼명을 `hostname`으로 바꾸는
+  안은 검토 대상으로 남긴다
+
+#### 초기 데이터
+
+확인된 피닝 도메인은 없다 (PoC 1 결과 문서 3장 — `drive.google.com`, `dl.google.com`,
+`storage.googleapis.com` 모두 정상 인터셉션). **첫 실제 후보는 `SECURITY_UPDATE` 쪽이다** —
+Chrome 자동 업데이트 / Safe Browsing 경로. 정확한 호스트 목록은 재측정 로그에서 추출해야 하며
+아직 확정되지 않았다.
 
 ---
 
@@ -456,8 +491,11 @@ ALTER TABLE hash_whitelist
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE bypass_domains (
     bypass_id      UUID         PRIMARY KEY,
-    domain_pattern VARCHAR(255) NOT NULL UNIQUE,
-    reason         TEXT         NOT NULL,   -- 인증서 피닝 앱 등
+    domain_pattern VARCHAR(255) NOT NULL UNIQUE
+                                CHECK (domain_pattern NOT LIKE '%*%'),  -- 와일드카드 금지 (2.4)
+    category       VARCHAR(24)  NOT NULL
+                                CHECK (category IN ('PINNED','SECURITY_UPDATE')),
+    reason         TEXT         NOT NULL,   -- 자유 서술 (어느 앱/어느 기능인지)
     is_active      BOOLEAN      NOT NULL DEFAULT TRUE,
     created_by     UUID         REFERENCES admin_users(admin_id),
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT now()
