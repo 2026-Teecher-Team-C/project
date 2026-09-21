@@ -8,8 +8,14 @@
 방법이다. OS 프록시 계층에 두었으므로 브라우저뿐 아니라 `curl`·런처·업데이터까지 같은 통로로
 덮는다.
 
-**이 저장소는 설계 문서만 담는다.** 동작하는 코드는
-[`poc1-response-holding`](https://github.com/2026-Teecher-Team-C/poc1-response-holding)에 있다.
+**이 저장소는 설계 문서만 담는다.** 동작하는 코드는 PoC 저장소에 있다.
+
+| 저장소 | 검증 대상 | 언어 |
+|---|---|---|
+| [`poc1-response-holding`](https://github.com/2026-Teecher-Team-C/poc1-response-holding) | 응답 보류 · 다운로드 판별 · 이벤트 대시보드 | Python (mitmproxy) |
+| [`poc2-streaming-hash-spool`](https://github.com/2026-Teecher-Team-C/poc2-streaming-hash-spool) | 스트리밍 SHA-256 + 스풀 단일 패스 | Java (WebFlux) |
+| [`poc3-yara-detection`](https://github.com/2026-Teecher-Team-C/poc3-yara-detection) | 해시 대조 + YARA 매칭 판정 | Python |
+| [`poc1-response-holding-java`](https://github.com/2026-Teecher-Team-C/poc1-response-holding-java) | 응답 보류 재검증 (참고용 — 리버스 프록시라 에이전트 구조와 불일치) | Java |
 
 ---
 
@@ -21,9 +27,11 @@
 | ✅ | **보류 상한** — Chrome·curl 모두 300초 초과. 검사 파이프라인의 시간 예산은 브라우저 제약을 받지 않는다 | PoC 1 |
 | ✅ | **다운로드 판별** — `Sec-Fetch-Mode` 기반 재설계로 오탐 139건 → 3건 | PoC 1 재측정 |
 | ✅ | **이벤트 대시보드** — SSE 실시간 스트림 | PoC 1 Part B |
-| ⬜ | **스트리밍 해시 + 스풀 보호** — 단일 패스, `UUID.tmp`·`0600`·XOR·인덱싱 제외 | PoC 2, 미착수 |
-| ⬜ | **서버 판정** — 해시 대조 + YARA 매칭 | PoC 3, 미착수 |
-| ⬜ | 검사 서버(Spring), 블룸 필터, 관리 콘솔, 배포 | 미착수 |
+| ✅ | **스트리밍 SHA-256 + 스풀 단일 패스** — 32MiB를 64KiB × 512 chunk로, 전체 집계 없이. 오류·크기 초과 시 미완성 파일 삭제 | PoC 2 |
+| ✅ | **서버 판정** — EICAR → `malicious` 0.255ms, 일반 텍스트 → `safe` 0.121ms. YARA 단독 경로도 변종으로 분리 검증 | PoC 3 |
+| ⬜ | **스풀 파일 보호 규칙** — `UUID.tmp` 파일명, `0600`·실행 비트 제거, XOR 인코딩, 인덱싱 제외 | 미착수 (제품 설계 7장) |
+| ⬜ | **에이전트 측 스풀링** — PoC 2는 검사 서버의 업로드 수신 경로를 검증했다. 보류된 응답을 에이전트가 스풀하는 경로는 별개다 | 미착수 |
+| ⬜ | 검사 서버 전체(블룸 필터·판정 API), 관리 콘솔, 배포 | 미착수 |
 
 **게이트는 통과했다.** 설계 전체가 기대던 "헤더 전송 전에 응답을 붙잡을 수 있는가"가 실측으로
 닫혔다. 남은 것은 구현이다.
@@ -73,8 +81,10 @@
 
 ## 지금 열려 있는 것
 
-- **PoC 2 (스트리밍 해시 + 스풀 보호 규칙)** — 다음 차례. 현재 판별은 헤더 시점으로 옮겼지만
-  해싱은 여전히 버퍼된 본문을 대상으로 한다
+- **스풀 파일 보호 규칙** — `UUID.tmp`, `0600`, XOR 인코딩, 인덱싱 제외가 아직 어느 PoC에도
+  없다. 제품 설계 7장이 CVE 세 건을 근거로 세운 원칙인데 코드로 검증된 적이 없다
+- **에이전트 측 스풀링** — PoC 2가 검증한 단일 패스 기법을 PoC 1의 보류 경로 위로 옮기는 일.
+  현재 에이전트는 버퍼된 본문을 해싱한다
 - `SECURITY_UPDATE` 바이패스의 정확한 호스트 목록 — fail-close가 브라우저 보안 갱신까지 막는
   문제의 대응
 - 남은 오탐 3건 — 원인이 각각 달라 단일 수정으로 닫히지 않는다
