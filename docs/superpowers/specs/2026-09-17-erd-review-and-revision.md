@@ -51,9 +51,17 @@
 
 ### 논리 오류
 
-6. **`not null` 남발** — `content_disposition`(상당수 다운로드에 없음), `file_size`(chunked 응답은
-   Content-Length 자체가 없음), `yara_matched`(해시 히트로 조기 판정 시 YARA 미실행),
-   `last_heartbeat_at`(등록 직후)은 모두 NULL이 나온다.
+6. **`not null` 남발** — `content_disposition`(상당수 다운로드에 없음 — 2026-09-21 PoC 1 실측으로
+   재확인: 오탐 139건 중 80건이 `content_disposition` 없이도 다운로드 후보로 잡혔다),
+   `mime_type`(`Content-Type` 헤더 부재 시 빈 문자열/NULL — **실측상 NULL이 나오는 유일한 칸**),
+   `yara_matched`(해시 히트로 조기 판정 시 YARA 미실행), `last_heartbeat_at`(등록 직후)은 모두
+   NULL이 나온다.
+   (`file_size`는 초안 작성 당시 "chunked 응답은 `Content-Length` 자체가 없어 NULL"로 추정했으나
+   2026-09-21 PoC 1 실측 결과 이 추정은 틀렸다 — 에이전트가 헤더가 아니라 **실제 수신 바이트 수**
+   (`len(flow.response.content)`)를 보고하므로 chunked 응답에서도 항상 채워진다. `file_size`를
+   NOT NULL로 전환하는 안은 검토 항목으로 남긴다 — `responseheaders` 스트리밍 전환 작업이
+   진행 중이라 지금 스키마 제약을 확정하지는 않는다. 근거:
+   `docs/superpowers/specs/2026-09-21-poc1-results-and-download-detection.md` 4장, 8장 항목 2·3)
 7. **카디널리티가 전부 1:N인데 의미상 1:1** — 유니크 제약이 없어 재검사와 정상 흐름이 구분되지 않는다.
 8. **`download_event.status`와 `verdicts.verdict` 이중 진실** — "차단됐나"를 두 곳에서 표현할 수 있어
    불일치가 발생한다. enum 정의도 없다.
@@ -320,9 +328,13 @@ CREATE TABLE download_events (
     request_host        VARCHAR(255) NOT NULL,
     url                 TEXT         NOT NULL,      -- 보존기간 정책 필요 (6장)
     filename            VARCHAR(512),
-    mime_type           VARCHAR(255),               -- 미지정 가능
+    mime_type           VARCHAR(255),               -- Content-Type 헤더 부재 시 NULL/빈 문자열
+                                                    -- (실측상 NULL이 나오는 유일한 칸)
     content_disposition TEXT,                       -- 상당수 다운로드에 없음
-    file_size           BIGINT,                     -- chunked 응답은 NULL
+                                                    -- (PoC 1 실측: 오탐 139건 중 80건)
+    file_size           BIGINT,                     -- 헤더가 아닌 실제 수신 바이트 수를 기록하므로
+                                                    -- chunked 응답에서도 항상 채워진다.
+                                                    -- NOT NULL 전환은 검토 대상 (미확정, 8장 참고)
     -- 파이프라인 진행 상태 (= "어디까지 갔나")
     pipeline_status     VARCHAR(16)  NOT NULL
                                      CHECK (pipeline_status IN
