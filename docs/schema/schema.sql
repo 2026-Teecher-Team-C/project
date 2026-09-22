@@ -160,7 +160,7 @@ CREATE TABLE download_events (
     CONSTRAINT ck_download_events_decision CHECK (decision IN
         ('RELEASED','BLOCKED','BYPASSED','FAIL_CLOSE')),
     CONSTRAINT ck_download_events_decision_source CHECK (decision_source IN
-        ('WHITELIST','BLACKLIST','CACHE','ENGINE','POLICY','FALLBACK')),
+        ('WHITELIST','BLACKLIST','CACHE','ENGINE','POLICY')),
     CONSTRAINT ck_download_events_completed
         CHECK (pipeline_status <> 'COMPLETED' OR decision IS NOT NULL)
 );
@@ -212,13 +212,16 @@ CREATE TABLE analysis_matches (
 );
 
 -- 10. 해시 블랙리스트 (삭제 대신 is_active=FALSE로 비활성화 — 이력 보존)
+--     hash_type = 'TLSH'는 향후 확장용 자리다. 현재 파이프라인에는 TLSH를 계산하는 단계도,
+--     거리 비교로 조회하는 단계도 없으므로 TLSH 행은 아무것도 탐지하지 않는다.
+--     탐지 엔진에 TLSH 단계를 넣기 전까지 등록하지 말 것.
 CREATE TABLE hash_blacklist (
     hash_type      VARCHAR(16)  NOT NULL DEFAULT 'SHA256',
     hash_value     VARCHAR(128) NOT NULL,
     reason         TEXT         NOT NULL,
     severity       VARCHAR(16)  NOT NULL DEFAULT 'HIGH',
-    source         VARCHAR(32)  NOT NULL DEFAULT 'MANUAL',
-    added_by       UUID,
+    source         VARCHAR(32)  NOT NULL DEFAULT 'MANUAL', -- IMPORT = 일괄 등록 (외부 TI 피드 연동 아님)
+    added_by       UUID,                                  -- 사람이 등록한 경우에만
     is_active      BOOLEAN      NOT NULL DEFAULT TRUE,
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
     deactivated_at TIMESTAMPTZ,
@@ -227,12 +230,16 @@ CREATE TABLE hash_blacklist (
         REFERENCES admin_users (admin_id),
     CONSTRAINT ck_hash_blacklist_type CHECK (hash_type IN ('SHA256','TLSH')),
     CONSTRAINT ck_hash_blacklist_severity
-        CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL'))
+        CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL')),
+    CONSTRAINT ck_hash_blacklist_source CHECK (source IN ('MANUAL','IMPORT'))
 );
 
 -- 11. 해시 화이트리스트 (오탐 복원 / 예외)
 --     블룸 필터는 삭제가 불가능하므로, 조회 순서상 블룸 필터보다 먼저 확인되는
 --     별도 레이어로 존재해야 한다 (설계서 4.1).
+--     SHA256만 허용한다. 유사도(TLSH) 화이트리스트는 정상 파일과 비슷하게 만든
+--     악성 파일을 통과시키므로 넣지 않는다. hash_type 칼럼은 블랙리스트와 키 구조를
+--     맞추기 위해 유지한다.
 CREATE TABLE hash_whitelist (
     hash_type            VARCHAR(16)  NOT NULL DEFAULT 'SHA256',
     hash_value           VARCHAR(128) NOT NULL,
@@ -245,7 +252,7 @@ CREATE TABLE hash_whitelist (
     CONSTRAINT pk_hash_whitelist PRIMARY KEY (hash_type, hash_value),
     CONSTRAINT fk_hash_whitelist_added_by FOREIGN KEY (added_by)
         REFERENCES admin_users (admin_id),
-    CONSTRAINT ck_hash_whitelist_type CHECK (hash_type IN ('SHA256','TLSH'))
+    CONSTRAINT ck_hash_whitelist_type CHECK (hash_type = 'SHA256')
     -- origin_quarantine_id -> quarantine_files FK는 [2] 섹션에서 추가 (순환 참조 회피)
 );
 

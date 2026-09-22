@@ -378,7 +378,7 @@ CREATE TABLE download_events (
     decision            VARCHAR(16)  CHECK (decision IN
                                        ('RELEASED','BLOCKED','BYPASSED','FAIL_CLOSE')),
     decision_source     VARCHAR(16)  CHECK (decision_source IN
-                                       ('WHITELIST','BLACKLIST','CACHE','ENGINE','POLICY','FALLBACK')),
+                                       ('WHITELIST','BLACKLIST','CACHE','ENGINE','POLICY')),
     cache_hit           BOOLEAN,                    -- 캐시 히트율 집계
     bytes_uploaded      BIGINT       NOT NULL DEFAULT 0,  -- 전송량 절감률 집계
     held_at             TIMESTAMPTZ  NOT NULL,      -- 응답 보류 시작
@@ -432,12 +432,13 @@ CREATE TABLE analysis_matches (
 -- ─────────────────────────────────────────────────────────
 CREATE TABLE hash_blacklist (
     hash_type      VARCHAR(16)  NOT NULL DEFAULT 'SHA256'
-                                CHECK (hash_type IN ('SHA256','TLSH')),
+                                CHECK (hash_type IN ('SHA256','TLSH')),  -- TLSH는 향후 확장용. 현재 미사용
     hash_value     VARCHAR(128) NOT NULL,
     reason         TEXT         NOT NULL,
     severity       VARCHAR(16)  NOT NULL DEFAULT 'HIGH'
                                 CHECK (severity IN ('LOW','MEDIUM','HIGH','CRITICAL')),
-    source         VARCHAR(32)  NOT NULL DEFAULT 'MANUAL',
+    source         VARCHAR(32)  NOT NULL DEFAULT 'MANUAL'
+                                CHECK (source IN ('MANUAL','IMPORT')),
     added_by       UUID         REFERENCES admin_users(admin_id),
     is_active      BOOLEAN      NOT NULL DEFAULT TRUE,   -- 삭제 대신 비활성화 (이력 보존)
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT now(),
@@ -447,7 +448,7 @@ CREATE TABLE hash_blacklist (
 
 CREATE TABLE hash_whitelist (
     hash_type            VARCHAR(16)  NOT NULL DEFAULT 'SHA256'
-                                      CHECK (hash_type IN ('SHA256','TLSH')),
+                                      CHECK (hash_type = 'SHA256'),  -- 유사도 화이트리스트 금지
     hash_value           VARCHAR(128) NOT NULL,
     reason               TEXT         NOT NULL,
     origin_quarantine_id UUID,                          -- 오탐 복원에서 파생된 경우 (FK는 11번 뒤에 추가)
