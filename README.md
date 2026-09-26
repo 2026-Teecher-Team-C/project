@@ -31,7 +31,7 @@
 | ✅ | **서버 판정** — EICAR → `malicious` 0.255ms, 일반 텍스트 → `safe` 0.121ms. YARA 단독 경로도 변종으로 분리 검증 | PoC 3 |
 | ⬜ | **스풀 파일 보호 규칙** — `UUID.tmp` 파일명, `0600`·실행 비트 제거, XOR 인코딩, 인덱싱 제외 | 미착수 (제품 설계 7장) |
 | ⚠️ | **에이전트 측 스풀링** — mitmproxy는 버퍼링으로만 헤더를 붙잡는다. `stream`을 켜면 200이 즉시 나가므로 헤더를 붙잡은 채 디스크로 스풀할 수 없다. 버퍼링 + `body_size_limit`으로 간다 (메모리 본문 × 2.3) | [`2026-09-26-header-timing.md`](docs/superpowers/specs/2026-09-26-header-timing.md) |
-| 🔨 | **에이전트 S1 파이프라인** — 판별 → 보류 → `CheckHash`/`SubmitFile` → 통과/403 → `ReportEvent`. 가짜 서버로 E2E 통과, 리뷰 중 | platform-agent #2 · #3 · #4 |
+| 🔨 | **에이전트 S1 파이프라인** — 판별 → 보류 → `CheckHash`/`SubmitFile` → 통과/403 → `ReportEvent`. 가짜 서버 기준 Chrome 154 실측 통과 (HTTPS 실사이트 체크섬 일치, EICAR 차단, 서버 불통 시 차단). 리뷰 중 | platform-agent #2 · #3 · #4, [`2026-09-26-agent-chrome-verification.md`](docs/superpowers/specs/2026-09-26-agent-chrome-verification.md) |
 | ⬜ | 검사 서버 전체(블룸 필터·판정 API), 관리 콘솔, 배포 | 미착수 |
 
 **게이트는 통과했다.** 설계 전체가 기대던 "헤더 전송 전에 응답을 붙잡을 수 있는가"가 실측으로
@@ -91,6 +91,7 @@
 - `SECURITY_UPDATE` 바이패스의 정확한 호스트 목록 — fail-close가 브라우저 보안 갱신까지 막는
   문제의 대응
 - 남은 오탐 3건 — 원인이 각각 달라 단일 수정으로 닫히지 않는다
+- 폴백 경로(Sec-Fetch 없음) 오탐 — Chrome 네트워크 시간 요청이 매 기동 차단된다 (platform-agent #5)
 - 보존·마스킹 주기 재검토, Safari·Firefox 보류 상한
 
 각 문서 맨 아래 `전달 상태` 체크리스트가 그 문서의 미결 항목이다.
