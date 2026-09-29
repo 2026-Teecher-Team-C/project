@@ -1,0 +1,7 @@
+big.bin
+spool.noindex/
+*.pem
+*.log
+mitm.pid
+rss.*
+out.*
