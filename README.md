@@ -30,7 +30,7 @@
 | ✅ | **스트리밍 SHA-256 + 스풀 단일 패스** — 32MiB를 64KiB × 512 chunk로, 전체 집계 없이. 오류·크기 초과 시 미완성 파일 삭제 | PoC 2 |
 | ✅ | **서버 판정** — EICAR → `malicious` 0.255ms, 일반 텍스트 → `safe` 0.121ms. YARA 단독 경로도 변종으로 분리 검증 | PoC 3 |
 | ⬜ | **스풀 파일 보호 규칙** — `UUID.tmp` 파일명, `0600`·실행 비트 제거, XOR 인코딩, 인덱싱 제외 | 미착수 (제품 설계 7장) |
-| ⚠️ | **에이전트 측 스풀링** — mitmproxy 공개 훅으로는 헤더를 붙잡은 채 스풀할 수 없어 S1은 버퍼링 + `body_size_limit`으로 갔다 (메모리 본문 × 2.3). mitmproxy 내부 패치(B안)로는 된다: 2GiB가 500MB 상한 아래에서 RSS 약 100MB로 통과, 403·역압·HTTP/2 확인. 채택은 팀 결정 대기 | [`2026-09-26-header-timing.md`](docs/superpowers/specs/2026-09-26-header-timing.md), [`2026-09-29-spool-spike.md`](docs/superpowers/specs/2026-09-29-spool-spike.md) |
+| ⚠️ | **에이전트 측 스풀링** — 당분간 버퍼링 + `body_size_limit` 500MB로 간다(2026-09-29 팀 결정, 메모리 본문 × 2.3, 초과는 차단). mitmproxy 내부 패치(B안)로 스풀이 된다는 건 확인했다: 2GiB가 500MB 상한 아래에서 RSS 약 100MB로 통과, 403·역압·HTTP/2 확인. B안은 고도화 단계에서 도입 | [`2026-09-26-header-timing.md`](docs/superpowers/specs/2026-09-26-header-timing.md), [`2026-09-29-spool-spike.md`](docs/superpowers/specs/2026-09-29-spool-spike.md) |
 | ✅ | **에이전트 S1 파이프라인** — 판별 → 보류 → `CheckHash`/`SubmitFile` → 통과/403 → `ReportEvent`. 가짜 서버 기준 Chrome 154 실측 통과 (HTTPS 실사이트 체크섬 일치, EICAR 차단, 서버 불통 시 차단). `develop`에 머지 | platform-agent #2 · #3 · #4, [`2026-09-26-agent-chrome-verification.md`](docs/superpowers/specs/2026-09-26-agent-chrome-verification.md) |
 | ⬜ | 검사 서버 전체(블룸 필터·판정 API), 관리 콘솔, 배포 | 미착수 |
 
@@ -84,9 +84,9 @@
 
 - **스풀 파일 보호 규칙** — `UUID.tmp`, `0600`, XOR 인코딩, 인덱싱 제외가 아직 어느 PoC에도
   없다. 제품 설계 7장이 CVE 세 건을 근거로 세운 원칙인데 코드로 검증된 적이 없다
-- **S2 "메모리에 전부 올리지 않음"의 방식** — 공개 훅으로는 안 되고, HTTP 레이어 패치(B안)는 스파이크로 동작을
-  확인했다. B안(내부 패치 + mitmproxy 버전 고정) / A안(버퍼링 + 상한, 초과는 차단) 중 팀 결정 필요
-  ([`2026-09-29-spool-spike.md`](docs/superpowers/specs/2026-09-29-spool-spike.md))
+- **B안(디스크 스풀) 도입 시점** — 2026-09-29 팀 결정으로 S2는 A안(버퍼링 + 500MB 상한)을 유지하고 B안은 고도화로
+  미뤘다. 그동안 500MB 초과 다운로드와 Content-Length 500MB 초과 비다운로드 응답은 차단(502)된다. 전환 작업은
+  [`2026-09-29-spool-spike.md`](docs/superpowers/specs/2026-09-29-spool-spike.md) 3장
 - **압축 인코딩 다운로드** — 에이전트는 압축을 풀지 않으므로 현재 정책 차단. 서버 격리 해제는
   `SubmitFileMetadata.content_encoding` 계약 변경이 필요하다
 - `SECURITY_UPDATE` 바이패스의 정확한 호스트 목록 — fail-close가 브라우저 보안 갱신까지 막는
