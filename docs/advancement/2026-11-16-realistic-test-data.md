@@ -12,7 +12,7 @@
   - 업로드·YARA로 흘려보낼 파일은 정상 파일(오픈소스 설치 파일 등)이면 충분하다. YARA 시간은 "룰 수 × 파일 크기"에 좌우되고, 매칭 여부와는 크게 상관없다.
 - **2단계 (탐지 품질 측정, 노션 "다음 2주"): 실제 샘플이 필요하다.** 격리 환경 규칙(5절)을 지킬 때만 진행한다.
 - **지금 코드에 걸리는 제약이 세 가지 있다.**
-  - 룰셋 업로드 **1MB 상한**
+  - 룰셋 업로드 **1MB 상한** → platform-server#94에서 32MiB(설정값)로 올림
   - 블룸 `expected-hash-count` 기본값 100,000
   - 대량 적재 경로 없음 (API는 한 건씩)
 
@@ -22,7 +22,7 @@
 |---|---|---|---|---|
 | 악성 SHA-256 | MalwareBazaar 전체 덤프 또는 최근 CSV ([export](https://bazaar.abuse.ch/export/)) | `hash_blacklist` | 10만 ~ 전체 | 전체 덤프는 1시간마다 갱신되고, CSV 내보내기는 로그인과 Auth-Key가 필요하다 |
 | 악성 TLSH | MalwareBazaar 샘플 메타데이터의 `tlsh` ([API](https://bazaar.abuse.ch/api/)) | `file_fingerprints` (가져오기 API) | 블랙리스트 중 TLSH가 있는 것 전부 | CSV에 `tlsh` 열이 있는지는 로그인 후 export 페이지에서 확인해야 한다(아직 확인 못 함). 없으면 API로 샘플별 조회 |
-| YARA 룰 | [YARA Forge](https://yarahq.github.io) core(약 5천 개) / extended(약 1.07만) / full(약 1.24만) ([releases](https://github.com/YARAHQ/yara-forge/releases)) | `rulesets`, `yara_rules` | core부터 시작, full까지 | 라이선스는 룰 출처마다 다르다. core 헤더는 Elastic License 2.0. 내부 측정용은 괜찮지만 제품에 넣어 배포하기 전에는 확인해야 한다 |
+| YARA 룰 | [YARA Forge](https://yarahq.github.io) core(약 5천 개) / extended(약 1.07만) / full(약 1.24만) ([releases](https://github.com/YARAHQ/yara-forge/releases)) | `rulesets`, `yara_rules` | core부터 시작, full까지 | 라이선스는 룰마다 다르다. core 기준 CC BY-SA 4.0(1,621개), DRL 1.1(377개), Volexity, BSD 2-Clause, Apache 2.0이 섞여 있고 나머지는 license 메타데이터가 없다(Elastic 룰은 들어 있지 않음). 내부 측정용은 괜찮지만 제품에 넣어 배포하기 전에는 확인해야 한다 |
 | 정상 파일 (업로드·YARA 부하용) | 오픈소스 설치 파일·아카이브 (예: Python, Node.js, 7-Zip, Git 설치 파일, Linux 패키지) | 업로드 대상(파일) | 크기 구간별 5개 이상 | 실제 PE·압축 구조라 YARA 비용이 무작위 바이트와 다르다 |
 | 정상 해시 (화이트리스트) | NIST NSRL RDS 일부, 또는 위 정상 파일의 해시 | `hash_whitelist` | 수천 ~ 수만 | 화이트리스트 조회 비용과 블룸 크기를 현실적으로 맞추기 위해 |
 
@@ -32,7 +32,7 @@
 
 | 제약 | 위치 | 영향 | 대응 |
 |---|---|---|---|
-| 룰셋 업로드 1MB 상한 | `UploadRulesetUseCase.MAX_BYTES` | YARA Forge core 파일이 1MB를 넘으면 올릴 수 없다 (실제 크기는 받아서 확인) | 상한을 설정값으로 빼서 벤치에서만 올리거나, 룰셋을 나눠 올린다. 상한을 바꾸는 건 별도 PR |
+| ~~룰셋 업로드 1MB 상한~~ (해결) | 콘솔·nginx·multipart·UseCase·엔진·gRPC·호출 시간 제한 7개 층 | core 7.7MB도 못 올렸다 | platform-server#94: 32MiB 설정값(`ruleset.max-source-bytes`, 엔진 `ENGINE_MAX_RULES_BYTES`), 엔진 호출 시간 제한 60초 |
 | 단일 `.yar` 파일만 | 룰셋 업로드 | `include`를 쓰는 룰 저장소는 그대로 못 올린다 | YARA Forge 패키지는 이미 한 파일로 합쳐져 있어 문제없을 것. 다른 저장소는 하나로 합친다 |
 | YARA 모듈 지원 | 엔진 `yara-python>=4.5` | 룰이 `pe`, `math`, `hash`, `dotnet`, `magic` 같은 모듈을 쓰면 엔진 빌드에 그 모듈이 있어야 컴파일된다 | 올리기 전에 엔진 컨테이너에서 `yara.compile()`로 컴파일되는지 먼저 확인한다. 실패한 룰 목록과 컴파일 시간도 기록한다 |
 | 블룸 크기 | `lookup.bloom-filter.expected-hash-count` (기본 100,000) | 해시를 그 이상 넣으면 오탐률이 설정값보다 올라간다. 오탐은 안전한 쪽이지만 DB 조회가 늘어 측정값이 왜곡된다 | 벤치 설정에서 실제 적재 수에 맞춘다. 운영값도 이 결과를 보고 정한다 |
@@ -121,12 +121,30 @@
 - **샘플 수와 종류를 기록한다.** 패밀리, 파일 형식, 수집 날짜를 남겨 탐지율을 해석할 수 있게 한다.
 - **변종 탐지율**은 노션 계획대로 직접 만든 변종(공백 붙이기, 일부 바이트 수정)으로 잰다. 원본 샘플을 다시 패킹하는 작업은 하지 않는다.
 
+## 5.1 YARA Forge 확인 결과 (2026-11-16, 릴리스 `20261115`)
+
+엔진과 같은 조건(yara-python 4.5.4, 메모리 1GiB / CPU 1개)에서 잰 값이다.
+
+| 패키지 | 파일 크기 | 룰 수 | 필요한 모듈 | 컴파일 | 최대 메모리 | 27MB PE 매칭 | 6.6MB ELF 매칭 |
+|---|---|---|---|---|---|---|---|
+| core | 7.7MB | 5,089 | `pe`, `dotnet`, `hash` | 1.2초 | 92MB | 0.43초 | 0.08초 |
+| extended | 17.5MB | 10,849 | + `math`, `string` | 2.7초 | 214MB | - | - |
+| full | 19.4MB | 11,852 | + `elf`, `console` | 3.9초 | 276MB | 0.66초 | 0.17초 |
+
+- 정상 파일(Python 3.12.8 Windows 설치 파일, `libpython3.12.so`)에서는 어느 패키지도 오탐을 내지 않았다.
+- 실제 스택에서 nginx를 거쳐 올린 결과 (platform-server#94 확인)
+
+| 패키지 | 업로드 | 활성화 | 엔진 메모리 |
+|---|---|---|---|
+| core | 201, 3.5초 | 200, 1.8초 | 최대 224MiB |
+| full | 201, 7.7초 | 200, 5.3초 | 최대 392MiB, 평상시 303MiB (제한 1GiB) |
+
 ## 6. 할 일
 
 1. [ ] abuse.ch Auth-Key 발급 (팀 계정 또는 개인). export 페이지에서 CSV 열 구성(`tlsh` 포함 여부)을 확인한다
-2. [ ] YARA Forge core·extended·full을 내려받아 파일 크기, 룰 수, 필요한 모듈을 확인한다. 엔진 컨테이너에서 컴파일을 시험한다
-3. [ ] 1MB 업로드 상한과 블룸 기대 개수를 벤치에서 바꿀 방법을 정한다(설정값으로 빼는 PR이 필요한지)
-4. [ ] `bench/seed/` 적재 스크립트 작성: API 경로(소량)와 COPY 경로(대량)
+2. [x] YARA Forge core·extended·full을 내려받아 파일 크기, 룰 수, 필요한 모듈을 확인한다. 엔진 컨테이너에서 컴파일을 시험한다 (5.1절)
+3. [x] 업로드 상한: platform-server#94로 32MiB. 블룸 기대 개수는 이미 설정값이라 적재 수를 본 뒤 환경변수로 맞춘다
+4. [ ] `bench/seed/` 적재 스크립트 작성: API 경로(소량)와 COPY 경로(대량). 2026-10-27에 만든 MalwareBazaar 해시 적재 스크립트(`import_malwarebazaar.py`, 커밋 안 됨, 로컬 백업)를 출발점으로 TLSH 지문 적재를 더한다
 5. [ ] 정상 파일 세트 준비: 크기 구간별 오픈소스 설치 파일, 그리고 해시 목록
 6. [ ] 운영 EC2에서 잴지 정한다(팀 합의). 잰다면 4.1절의 측정 전 체크리스트, 정리 스크립트를 준비한다
 7. [ ] 적재 → 블룸 재구축 → 적재 기록 작성 → [측정 계획](2026-11-16-pipeline-latency-measurement.md) 1단계(계측)로 넘어간다
